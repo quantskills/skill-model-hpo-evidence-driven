@@ -38,7 +38,7 @@ python scripts/run_hpo_search.py --input examples/hpo_lgbm_codex_external.json
 
 ## Key Outputs
 
-Each run writes a timestamped output directory containing trial records, leaderboard CSVs, search-space versions, controller decisions, selected parameters, holdout metrics, and a markdown search report. LLM decision runs also write evidence and decision templates under `codex_decisions/`.
+Each run writes a timestamped output directory containing trial records, leaderboard CSVs, search-space versions, controller decisions, selected parameters, and a markdown search report. Holdout metrics are written only when a holdout/test window is configured. LLM decision runs also write evidence and decision templates under `codex_decisions/`.
 
 See `references/input_schema.md`, `references/codex_external_workflow.md`, and `references/output_contract.md` for the full contract.
 

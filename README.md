@@ -137,7 +137,7 @@ skill-model-hpo-evidence-driven/
 python -m pip install -r requirements.txt
 ```
 
-如仅运行 LGBM 示例，核心依赖为 `numpy`、`pandas`、`scikit-learn`、`lightgbm`、`PyYAML`；运行 MLP 示例需要额外安装 `torch`。
+`requirements.txt` 覆盖 LGBM 与 MLP 示例依赖；如只手动安装 LGBM 最小依赖，可不安装 `torch`。
 
 先跑 LGBM smoke test：
 
@@ -231,27 +231,38 @@ search_space_versions.json
 round_history.json
 trial_evidence_history.json
 space_controller_decisions.json
-best_params.json
+decision_memory.json
+failure_modes.json
 score_best_params.json
+best_params.json
 final_selection.json
-final_holdout_metrics.json
+run_summary.json
 search_report.md
 ```
 
-Grid search 额外输出：
+条件输出包括：
 
 ```text
-grid_manifest.json
-grid_trials_resolved.json
+grid_manifest.json                 # search.method=grid
+grid_trials_resolved.json          # search.method=grid
+codex_decisions/                   # decision_provider.type=codex_external
+final_neighbor_trials.csv          # 运行进入最终选择阶段
+final_neighbor_window_metrics.csv  # 运行进入最终选择阶段
+final_selection_evidence.json      # final_selector.enabled=true
+final_holdout_metrics.json         # 配置 holdout/test window
+final_holdout_predictions.csv      # 配置 holdout/test window
+final_holdout_window_metrics.csv   # 配置 holdout/test window
 ```
+
+Grid search 额外输出的 `grid_manifest.json` 记录网格来源、候选数量、选择策略和参数顺序；`grid_trials_resolved.json` 记录实际执行的有序参数列表。
 
 LLM decision 模式额外输出：
 
 ```text
 codex_decisions/*_evidence.json
 codex_decisions/*_decision.template.json
-codex_decisions/*_decision.json
-external_decision_required.json
+codex_decisions/*_decision.json       # 外部 LLM/Agent 写入后存在
+external_decision_required.json          # on_missing=stop 时存在
 ```
 
 完整字段见：

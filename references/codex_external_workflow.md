@@ -18,7 +18,7 @@ The external LLM decision step acts as the decision maker:
 - read generated evidence JSON
 - reason over trial metrics and search-space constraints
 - write a strict decision JSON file
-- rerun or resume the command
+- rerun the command with the same `task.run_id` after writing the decision file
 
 The Python runtime never trusts the external decision blindly. Every externally written decision is passed through schema validation and guarded search-space constraints before it is accepted.
 
@@ -120,6 +120,6 @@ Interactive LLM decision mode:
 3. Open `external_decision_required.json` in the run directory.
 4. Read the referenced evidence file.
 5. Write the referenced decision file.
-6. Rerun the same command with the same `task.run_id` if deterministic continuation is needed.
+6. Rerun the same command with the same `task.run_id` so the runtime can consume the decision file.
 
-Current implementation is optimized for simple LLM decision handoff through files. A future version can add a true step runner to avoid rerunning earlier rounds.
+Current implementation is optimized for simple LLM decision handoff through files. It does not implement checkpoint resume: rerunning with the same `task.run_id` re-executes the search while reading existing decision files from the run directory. A future version can add a true step runner to avoid rerunning earlier rounds.
