@@ -1,41 +1,64 @@
 ---
-name: my-skill-name
-description: "One sentence on what this skill does, with concrete capabilities. Use when an agent needs to <trigger scenario 1>, <trigger scenario 2>, or <trigger scenario 3> on portable agent platforms such as Claude Code, OpenClaw, or Codex-style skill systems."
-quantSkills:
-  organization: https://github.com/quantskills
-  repository: quantskills/skill-my-skill-name
-  repository_url: https://github.com/quantskills/skill-my-skill-name
-  project_type: skill
-  collection: <collection-name>
-  license: GPL-3.0
-  category: tooling            # trader-research / factor / data-api / replication / monitor / analyst / tooling
-  tags: [tag-one, tag-two]     # 小写连字符,1-10 个
-  platforms: [claude-code, codex, openclaw]
-  language: zh-en
-  status: draft                # draft / stable / deprecated
-  validation_level: listed     # listed / runnable / verified(社区三级验证体系)
-  maintainer_type: community   # official / community
-  requires: []                 # dependent sibling skill-* or agent-* repository names
-  summary_zh: 一句话中文简介(8-120 字符)
-  summary_en: One-line English summary (8-200 chars)
+name: model-hpo-evidence-driven
+description: "Run evidence-driven LLM decision or deterministic grid hyperparameter search for quantitative multi-factor models. Use when an agent needs to optimize LGBM or MLP hyperparameters on local factor/label CSV data, let an LLM adapt search spaces from trial evidence through guarded decision files, run budgeted grid search, or export reproducible best-parameter artifacts without factor generation or a full trading backtest."
+metadata:
+  short-description: Evidence-driven or grid model hyperparameter search
+  quantSkills:
+    organization: https://github.com/quantskills
+    repository: quantskills/skill-model-hpo-evidence-driven
+    repository_url: https://github.com/quantskills/skill-model-hpo-evidence-driven
+    project_type: skill
+    collection: model-hpo
+    license: GPL-3.0-only
+    category: tooling
+    tags: [model-hpo, hyperparameter-search, evidence-driven, grid-search]
+    platforms: [codex]
+    language: zh-en
+    status: active
+    validation_level: runnable
+    maintainer_type: community
+    requires: []
+    summary_zh: 使用 trial evidence 驱动的 LLM 搜索空间调整或确定性 grid 搜索优化 LGBM/MLP 多因子模型超参数。
+    summary_en: Optimize LGBM/MLP quant factor model hyperparameters with trial-evidence-driven LLM search-space adaptation or deterministic grid search.
 ---
 
-# My Skill Name
+# Model HPO Evidence Driven
 
-Use this skill to <核心用途一句话>.
+Use this skill to run hyperparameter search for LGBM or MLP quantitative multi-factor models on local factor and label files. The skill supports two independent search methods: evidence-driven search-space adaptation and deterministic grid search.
 
 ## Core Workflow
 
-1. Step one.
-2. Step two.
+1. Read `references/input_schema.md` before preparing the input JSON.
+2. Prepare local factor and label CSV/parquet files with one row per `(date, ticker)` observation.
+3. Choose `search.model_type`: `lgbm` or `mlp`.
+4. Choose `search.method`: `evidence_driven` for adaptive trial-evidence search, or `grid` for deterministic grid search.
+5. Run a local smoke test first:
+
+```bash
+python scripts/run_hpo_search.py --input examples/hpo_lgbm_smoke.json
+```
+
+6. For grid search, run `examples/hpo_lgbm_grid_search.json` or `examples/hpo_mlp_grid_search.json`.
+7. For LLM decision search, run `examples/hpo_lgbm_codex_external.json`; the runtime writes evidence and decision templates under the run directory.
+8. Read `references/output_contract.md` before consuming generated artifacts.
 
 ## Output Contract
 
-Produce:
+Produce a timestamped run directory under `output_root`, including:
 
-- `<output_file_1>`
-- a concise report
+- `search_manifest.json`
+- `resolved_config.yaml`
+- `trials.jsonl`
+- `trial_leaderboard.csv`
+- `best_params.json`
+- `search_report.md`
+- `grid_manifest.json` and `grid_trials_resolved.json` when `search.method=grid`
+- `codex_decisions/` evidence and decision templates when `decision_provider.type=codex_external`
 
 ## References
 
-Use `references/source_boundary.md`.
+- Use `references/source_boundary.md` for data, LLM decision, and research boundaries.
+- Use `references/input_schema.md` for input fields, search methods, and decision-provider settings.
+- Use `references/output_contract.md` for artifact names and result fields.
+- Use `references/codex_external_workflow.md` for the LLM decision handoff workflow.
+- Use `references/validation_notes.md` for assumptions, checks, limitations, and risk boundaries.

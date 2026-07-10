@@ -1,2 +1,5 @@
-name: my-skill-name
+name: model-hpo-evidence-driven
 entrypoint: SKILL.md
+display_name: Model HPO Evidence Driven
+short_description: Optimize LGBM/MLP quant factor model hyperparameters with evidence-driven LLM search-space adaptation or deterministic grid search.
+default_prompt: Run the LGBM smoke hyperparameter search using examples/hpo_lgbm_smoke.json and summarize the run directory, leaderboard, best_params, and search_report artifacts.
