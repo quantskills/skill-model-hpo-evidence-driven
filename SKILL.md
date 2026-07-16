@@ -22,6 +22,45 @@ metadata:
     summary_en: Optimize LGBM/MLP quant factor model hyperparameters with trial-evidence-driven LLM search-space adaptation or deterministic grid search.
 ---
 
+```json qsh-form
+{
+  "version": 1,
+  "task": {
+    "placeholder": "说明本地因子/标签文件、特征列、标签列、切分方式和优化目标，或上传输入配置",
+    "required": true
+  },
+  "fields": [
+    {
+      "key": "model_type",
+      "label": "模型类型",
+      "type": "select",
+      "default": "lgbm",
+      "options": [
+        { "value": "lgbm", "label": "LightGBM" },
+        { "value": "mlp", "label": "MLP" }
+      ]
+    },
+    {
+      "key": "search_method",
+      "label": "搜索方法",
+      "type": "select",
+      "default": "evidence_driven",
+      "options": [
+        { "value": "evidence_driven", "label": "证据驱动自适应" },
+        { "value": "grid", "label": "确定性网格搜索" }
+      ]
+    },
+    {
+      "key": "trial_budget",
+      "label": "试验预算",
+      "type": "number",
+      "placeholder": "例如 50"
+    }
+  ],
+  "prompt_template": "{{#task}}任务与材料：\n{{task}}\n\n{{/task}}{{#attachments}}用户上传的材料（已放入工作区）：\n{{attachments}}\n\n{{/attachments}}基于本地因子和标签数据，为 {{model_type}} 执行 {{search_method}} 超参数搜索。{{#trial_budget}}试验预算为 {{trial_budget}}。{{/trial_budget}}先做小规模冒烟测试，再生成可复现的试验清单、排行榜、最佳参数和证据链；不生成新因子，也不把本任务扩展成完整交易回测，输出中文报告。"
+}
+```
+
 # Model HPO Evidence Driven
 
 Use this skill to run hyperparameter search for LGBM or MLP quantitative multi-factor models on local factor and label files. The skill supports two independent search methods: evidence-driven search-space adaptation and deterministic grid search.
