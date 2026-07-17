@@ -1,6 +1,7 @@
 {
   "output_root": "../outputs/mlp_smoke",
   "config": {
+    "compatibility": {"profile": "legacy_v1"},
     "task": {
       "name": "skill_mlp_smoke",
       "seed": 42
@@ -17,6 +18,7 @@
       "label_col": "y",
       "ticker_dtype": "preserve",
       "all_null_feature_policy": "allow",
+      "strict_point_in_time": false,
       "compute_hash": false
     },
     "search": {
@@ -90,6 +92,12 @@
     },
     "final_selector": {
       "enabled": false
+    },
+    "reproducibility": {
+      "trial_seed_policy": "legacy_trial_index",
+      "confirmation": {
+        "enabled": false
+      }
     }
   }
 }

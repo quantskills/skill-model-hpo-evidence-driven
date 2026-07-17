@@ -42,6 +42,9 @@
 - trial evidence、decision memory、leaderboard 和 search report
 - LLM decision 文件 handoff，使外部决策过程可审计、可校验、可复盘
 - 可选 offline final selection，用已有 run 的 trial 记录重新做最终参数选择
+- 显式注册的 factor provider、feature pipeline 和 model plugin，方便接入用户自己的因子存储与模型
+- 默认 `legacy_v1` 复现旧版 `rankic_ir`、逐 trial seed 和自动测试集评估
+- 可显式切换 `research_v2`，启用严格 point-in-time、共同 seed、多 seed 确认和封存 holdout
 
 ## 工作流
 
@@ -52,8 +55,9 @@
 4. 每个 trial 训练 LGBM 或 MLP，并计算验证集指标
 5. evidence-driven 模式下，runtime 汇总 trial evidence，由 LLM decision 文件或规则控制器决定下一轮搜索空间
 6. grid 模式下，runtime 固定展开参数组合并按预算顺序评估
-7. 输出 leaderboard、best_params、search_report 和 holdout 报告
-8. 后续用独立研究流程做样本外、交易成本、风险暴露和组合级验证
+7. 输出 leaderboard、confirmation artifacts、best_params 和 search_report
+8. `legacy_v1` 自动输出测试结果；`research_v2` 冻结参数后再用独立命令启封 holdout
+9. 后续做交易成本、风险暴露和组合级验证
 ```
 
 默认 LGBM smoke test：
@@ -87,6 +91,7 @@ examples/hpo_mlp_smoke.json
 examples/hpo_lgbm_grid_search.json
 examples/hpo_mlp_grid_search.json
 examples/hpo_lgbm_codex_external.json
+examples/hpo_custom_extension_smoke.json
 ```
 
 关键字段见：
@@ -111,18 +116,23 @@ skill-model-hpo-evidence-driven/
 │   ├── hpo_mlp_grid_search.json        # MLP generated grid 示例
 │   ├── hpo_lgbm_grid_smoke.json        # 显式 grid_trials 示例
 │   ├── hpo_lgbm_codex_external.json    # LLM decision 示例
+│   ├── hpo_custom_extension_smoke.json # 自定义 provider/pipeline/model 示例
 │   ├── toy_factors.csv                 # toy 因子数据
 │   └── toy_labels.csv                  # toy 标签数据
 ├── references/
 │   ├── source_boundary.md              # 数据、LLM 决策与研究边界
 │   ├── input_schema.md                 # 输入字段说明
 │   ├── output_contract.md              # 输出产物契约
+│   ├── extension_api.md                # 用户扩展接口与变量说明
 │   ├── codex_external_workflow.md      # LLM decision handoff 说明
 │   └── validation_notes.md             # 假设、限制与风险边界
 ├── scripts/
 │   ├── run_hpo_search.py               # CLI 入口
 │   ├── run_offline_final_selection.py  # 离线最终参数选择入口
+│   ├── run_holdout_evaluation.py        # 显式、可审计的 holdout 入口
 │   └── hpo_runtime/                    # 自包含 HPO runtime
+├── extension_templates/
+│   └── example_extensions.py           # 独立的用户扩展示例区
 └── agents/
     ├── openai.yaml                     # Codex/agent metadata
     ├── cursor-rule.mdc                 # Cursor rule metadata
@@ -164,6 +174,26 @@ python scripts/run_hpo_search.py   --input examples/hpo_mlp_grid_search.json
 ```bash
 python scripts/run_hpo_search.py   --input examples/hpo_lgbm_codex_external.json
 ```
+
+运行自定义扩展示例：
+
+```bash
+python scripts/run_hpo_search.py --input examples/hpo_custom_extension_smoke.json
+```
+
+冻结搜索结果后显式运行 holdout：
+
+```bash
+python scripts/run_holdout_evaluation.py \
+  --source-run-dir <run-dir> \
+  --confirm-holdout-access
+```
+
+## 自定义因子和模型
+
+用户可改部分已隔离在 `extension_templates/`。这里提供 factor provider、feature pipeline 和 model plugin 的完整示例；生产代码建议放在 Skill 目录之外的用户项目中，再通过 `extensions.plugin_roots` 和 `extensions.modules` 显式加载。
+
+旧配置仍默认使用 `file_panel`、`cross_sectional` 以及内置 `lgbm`/`mlp`。自定义扩展必须遵守新的目标隔离接口；完整变量定义见 `references/extension_api.md`。
 
 运行时会输出类似：
 
@@ -207,6 +237,8 @@ best_score: ...
 | `config.search.grid` | object | generated grid 配置，`method=grid` 时使用 |
 | `config.search.grid_trials` | list[object] | 显式参数列表，优先级高于 generated grid |
 
+默认 `compatibility.profile=legacy_v1`，用于复现旧版 `rankic_ir` 实验。需要严格 PIT、`robust_rankic`、共同 seed、多 seed 确认和封存 holdout 时，显式设置 `compatibility.profile=research_v2`。
+
 ### LLM decision
 
 | 字段 | 类型 | 说明 |
@@ -236,6 +268,9 @@ failure_modes.json
 score_best_params.json
 best_params.json
 final_selection.json
+confirmation_seed_metrics.csv
+confirmation_leaderboard.csv
+confirmation_summary.json
 run_summary.json
 search_report.md
 ```
@@ -249,9 +284,15 @@ codex_decisions/                   # decision_provider.type=codex_external
 final_neighbor_trials.csv          # 运行进入最终选择阶段
 final_neighbor_window_metrics.csv  # 运行进入最终选择阶段
 final_selection_evidence.json      # final_selector.enabled=true
-final_holdout_metrics.json         # 配置 holdout/test window
-final_holdout_predictions.csv      # 配置 holdout/test window
-final_holdout_window_metrics.csv   # 配置 holdout/test window
+```
+
+`legacy_v1` 主搜索会生成 `final_holdout_*` 文件；`research_v2` 使用独立 holdout 目录：
+
+```text
+holdout_access_manifest.json
+final_holdout_metrics.json
+final_holdout_predictions.csv
+final_holdout_window_metrics.csv
 ```
 
 Grid search 额外输出的 `grid_manifest.json` 记录网格来源、候选数量、选择策略和参数顺序；`grid_trials_resolved.json` 记录实际执行的有序参数列表。
@@ -273,7 +314,7 @@ references/output_contract.md
 
 ## 边界说明
 
-本 Skill 用于量化研究自动化。它只优化模型超参数，不生成因子，不承诺收益，不替代组合级回测。验证集指标用于搜索和选择参数，holdout 指标只用于最终报告；任何输出参数都应在独立数据、交易成本、风险暴露和组合约束下重新验证。
+本 Skill 用于量化研究自动化。它只优化模型超参数，不生成因子，不承诺收益，不替代组合级回测。为严格隔离测试集应使用 `research_v2`；任何最终参数仍应在交易成本、风险暴露和组合约束下重新验证。
 
 ## License
 

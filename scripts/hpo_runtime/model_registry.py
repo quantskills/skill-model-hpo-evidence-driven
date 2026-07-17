@@ -19,7 +19,13 @@ class ModelSpec:
 
 
 class BaseModel:
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        *,
+        sample_weight: pd.Series | None = None,
+    ) -> None:
         raise NotImplementedError
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -36,9 +42,9 @@ class RidgeModel(BaseModel):
         self.model = Ridge(**dict(params))
         self._num_features = 0
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, X: pd.DataFrame, y: pd.Series, *, sample_weight: pd.Series | None = None) -> None:
         self._num_features = X.shape[1]
-        self.model.fit(X, y)
+        self.model.fit(X, y, sample_weight=sample_weight)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         return self.model.predict(X)
@@ -59,8 +65,8 @@ class LightGBMModel(BaseModel):
         self.params = dict(params)
         self.model = LGBMRegressor(**self.params)
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
-        self.model.fit(X, y)
+    def fit(self, X: pd.DataFrame, y: pd.Series, *, sample_weight: pd.Series | None = None) -> None:
+        self.model.fit(X, y, sample_weight=sample_weight)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         return self.model.predict(X)
@@ -114,7 +120,7 @@ class SimpleMLPModel(BaseModel):
         self.num_params = int(sum(p.numel() for p in model.parameters()))
         self.model = model
 
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, X: pd.DataFrame, y: pd.Series, *, sample_weight: pd.Series | None = None) -> None:
         torch = self.torch
         if self.model is None:
             self._build(X.shape[1])
@@ -122,12 +128,17 @@ class SimpleMLPModel(BaseModel):
         self.model.train()
         x_tensor = torch.tensor(X.to_numpy(dtype="float32"), dtype=torch.float32)
         y_tensor = torch.tensor(y.to_numpy(dtype="float32").reshape(-1, 1), dtype=torch.float32)
+        weight_tensor = None
+        if sample_weight is not None:
+            weight_tensor = torch.tensor(
+                sample_weight.to_numpy(dtype="float32").reshape(-1, 1),
+                dtype=torch.float32,
+            )
         lr = float(self.params.get("learning_rate", 1e-3))
         wd = float(self.params.get("weight_decay", 0.0))
         batch_size = int(self.params.get("batch_size", 4096))
         max_epochs = int(self.params.get("max_epochs", 30))
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
-        loss_fn = torch.nn.MSELoss()
         generator = torch.Generator().manual_seed(self.seed)
         n = x_tensor.shape[0]
         for _ in range(max_epochs):
@@ -135,7 +146,12 @@ class SimpleMLPModel(BaseModel):
             for start in range(0, n, batch_size):
                 idx = perm[start : start + batch_size]
                 pred = self.model(x_tensor[idx])
-                loss = loss_fn(pred, y_tensor[idx])
+                squared_error = (pred - y_tensor[idx]) ** 2
+                if weight_tensor is None:
+                    loss = squared_error.mean()
+                else:
+                    batch_weight = weight_tensor[idx]
+                    loss = (squared_error * batch_weight).sum() / batch_weight.sum().clamp_min(1e-12)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 clip_norm = float(self.params.get("gradient_clip_norm", 0.0) or 0.0)
@@ -183,15 +199,10 @@ def parse_model_specs(cfg: Mapping[str, Any], experiment: Any) -> list[ModelSpec
 
 
 def create_model(spec: ModelSpec, seed: int) -> BaseModel:
-    if spec.type == "ridge":
-        return RidgeModel(spec.params)
-    if spec.type in {"lightgbm", "lgbm"}:
-        params = dict(spec.params)
-        params["objective"] = "regression"
-        params["metric"] = "rmse"
-        params.setdefault("random_state", seed)
-        params.setdefault("verbose", -1)
-        return LightGBMModel(params)
-    if spec.type == "mlp":
-        return SimpleMLPModel(spec.params, seed=seed)
-    raise ConfigError(f"Unsupported model type: {spec.type}")
+    """Compatibility facade backed by the extension registry."""
+    from extension_registry import REGISTRY
+    from plugin_loader import ensure_builtin_extensions
+
+    ensure_builtin_extensions()
+    plugin = REGISTRY.get_model_plugin(spec.type)
+    return plugin.create(spec.params, seed)

@@ -1,5 +1,5 @@
 name: model-hpo-evidence-driven
 entrypoint: SKILL.md
 display_name: Model HPO Evidence Driven
-short_description: Optimize LGBM/MLP quant factor model hyperparameters with evidence-driven LLM search-space adaptation or deterministic grid search.
-default_prompt: Run the LGBM smoke hyperparameter search using examples/hpo_lgbm_smoke.json and summarize the run directory, leaderboard, best_params, and search_report artifacts.
+short_description: Reproduce legacy RankIC-IR HPO or opt into robust sealed-holdout validation.
+default_prompt: Run the default legacy_v1 LGBM smoke search, verify its historical score and automatic holdout artifacts, and report the compatibility profile used.

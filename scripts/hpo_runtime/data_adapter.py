@@ -192,8 +192,10 @@ def _select_feature_columns(features: pd.DataFrame, cfg: Mapping[str, Any]) -> l
     return feature_cols
 
 
-def _check_available_date(features: pd.DataFrame, warnings: list[str]) -> None:
+def _check_available_date(features: pd.DataFrame, warnings: list[str], *, strict: bool) -> None:
     if "available_date" not in features.columns:
+        if strict:
+            raise ConfigError("Strict point-in-time mode requires feature column available_date")
         warnings.append("point_in_time_risk: available_date column is missing")
         return
     available = normalize_date_series(features["available_date"])
@@ -202,10 +204,20 @@ def _check_available_date(features: pd.DataFrame, warnings: list[str]) -> None:
         raise ValueError(f"available_date is after signal date for {bad} rows")
 
 
-def _check_label_window(labels: pd.DataFrame, warnings: list[str], trade_lag_days: int) -> None:
+def _check_label_window(
+    labels: pd.DataFrame,
+    warnings: list[str],
+    trade_lag_days: int,
+    *,
+    strict: bool,
+) -> None:
     if trade_lag_days < 0:
         raise ConfigError("time.trade_lag_days must be non-negative")
     if "label_start_date" not in labels.columns or "label_end_date" not in labels.columns:
+        if strict:
+            raise ConfigError(
+                "Strict point-in-time mode requires label_start_date and label_end_date"
+            )
         warnings.append("label_window_risk: label_start_date/label_end_date columns are missing")
         return
     feature_date = normalize_date_series(labels["date"])
@@ -228,7 +240,47 @@ def _check_label_window(labels: pd.DataFrame, warnings: list[str], trade_lag_day
             )
 
 
-def build_panel(cfg: Mapping[str, Any]) -> PanelData:
+def _effective_data_end(cfg: Mapping[str, Any]) -> Any:
+    configured = optional_value(cfg, ["data", "end_date"])
+    if str(cfg.get("_run_phase", "search")) != "search":
+        return configured
+    if str(optional_value(cfg, ["holdout", "mode"], "automatic")).lower() == "automatic":
+        return configured
+    validation_cfg = require_mapping(cfg, ["validation"])
+    method = str(validation_cfg.get("method"))
+    boundary = None
+    if method == "fixed_train_valid_test":
+        boundary = validation_cfg.get("valid_end")
+    elif method == "expanding_walk_forward" and isinstance(validation_cfg.get("folds"), list):
+        fold_ends = [
+            fold.get("valid_end")
+            for fold in validation_cfg["folds"]
+            if isinstance(fold, Mapping) and fold.get("valid_end") not in (None, "")
+        ]
+        if fold_ends:
+            boundary = max(
+                int(normalize_date_series(pd.Series([value])).iloc[0])
+                for value in fold_ends
+            )
+    else:
+        locked = optional_value(cfg, ["time", "locked_test_start"])
+        if locked not in (None, ""):
+            boundary = int(normalize_date_series(pd.Series([locked])).iloc[0]) - 1
+        elif bool(optional_value(cfg, ["data", "strict_point_in_time"], False)):
+            raise ConfigError(
+                "Strict walk-forward search requires time.locked_test_start "
+                "or explicit expanding validation.folds"
+            )
+    if boundary in (None, ""):
+        return configured
+    boundary_value = int(normalize_date_series(pd.Series([boundary])).iloc[0])
+    if configured in (None, ""):
+        return boundary_value
+    configured_value = int(normalize_date_series(pd.Series([configured])).iloc[0])
+    return min(configured_value, boundary_value)
+
+
+def _build_file_panel(cfg: Mapping[str, Any]) -> PanelData:
     base_dir = cfg.get("_config_dir", ".")
     feature_path = resolve_path(require_value(cfg, ["data", "feature_path"]), base_dir)
     label_path = resolve_path(require_value(cfg, ["data", "label_path"]), base_dir)
@@ -243,7 +295,7 @@ def build_panel(cfg: Mapping[str, Any]) -> PanelData:
     feature_usecols = [date_col, ticker_col, "available_date", *feature_include] if feature_include else None
     label_usecols = [date_col, ticker_col, label_col, "label_start_date", "label_end_date"]
     start_date = optional_value(cfg, ["data", "start_date"])
-    end_date = optional_value(cfg, ["data", "end_date"])
+    end_date = _effective_data_end(cfg)
     max_rows = optional_value(cfg, ["data", "max_rows"])
     chunksize = int(optional_value(cfg, ["data", "read_chunksize"], 500_000))
     features = _standardize_key_columns(
@@ -272,6 +324,11 @@ def build_panel(cfg: Mapping[str, Any]) -> PanelData:
         cfg,
         "label_df",
     )
+    if "available_date" in features.columns:
+        features["available_date"] = normalize_date_series(features["available_date"])
+    for column in ("label_start_date", "label_end_date"):
+        if column in labels.columns:
+            labels[column] = normalize_date_series(labels[column])
     _validate_unique_key(features, "feature_df")
     _validate_unique_key(labels, "label_df")
     if label_col in features.columns:
@@ -280,9 +337,15 @@ def build_panel(cfg: Mapping[str, Any]) -> PanelData:
         raise ConfigError(f"label_df is missing configured label_col: {label_col}")
     labels = labels.rename(columns={label_col: "y"})
 
-    _check_available_date(features, warnings)
+    strict_point_in_time = bool(data_cfg.get("strict_point_in_time", False))
+    _check_available_date(features, warnings, strict=strict_point_in_time)
     trade_lag_days = int(optional_value(cfg, ["time", "trade_lag_days"], 0))
-    _check_label_window(labels, warnings, trade_lag_days)
+    _check_label_window(
+        labels,
+        warnings,
+        trade_lag_days,
+        strict=strict_point_in_time,
+    )
     feature_cols = _select_feature_columns(features, cfg)
 
     keep_label_cols = ["date", "ticker", "y"]
@@ -305,6 +368,8 @@ def build_panel(cfg: Mapping[str, Any]) -> PanelData:
         else:
             universe_policy = "metadata_joined"
     else:
+        if strict_point_in_time:
+            raise ConfigError("Strict point-in-time mode requires data.universe_path")
         warnings.append("universe_risk: universe_df is missing; using feature/label intersection")
     if panel.empty:
         raise ValueError("Panel is empty after universe filtering")
@@ -342,8 +407,65 @@ def build_panel(cfg: Mapping[str, Any]) -> PanelData:
         "num_all_null_features": int(len(all_null_feature_cols)),
         "all_null_feature_columns": all_null_feature_cols,
         "all_null_feature_policy": all_null_policy,
+        "strict_point_in_time": strict_point_in_time,
+        "run_phase": str(cfg.get("_run_phase", "search")),
+        "effective_end_date": int(panel["date"].max()),
     }
     return PanelData(panel=panel, feature_columns=feature_cols, warnings=warnings, metadata=metadata)
+
+
+def _validate_panel_data(
+    value: Any,
+    provider_name: str,
+    cfg: Mapping[str, Any] | None = None,
+) -> PanelData:
+    if not isinstance(value, PanelData):
+        raise ConfigError(f"Factor provider {provider_name!r} must return data_adapter.PanelData")
+    panel = value.panel
+    if not isinstance(panel, pd.DataFrame) or panel.empty:
+        raise ConfigError(f"Factor provider {provider_name!r} returned an empty or invalid panel")
+    required = {"date", "ticker", "y"}
+    missing = sorted(required - set(panel.columns))
+    if missing:
+        raise ConfigError(f"Factor provider {provider_name!r} panel is missing canonical columns: {missing}")
+    if panel.duplicated(["date", "ticker"]).any():
+        raise ConfigError(f"Factor provider {provider_name!r} returned duplicated (date, ticker) rows")
+    if not isinstance(value.feature_columns, list) or not value.feature_columns:
+        raise ConfigError(f"Factor provider {provider_name!r} must return a non-empty feature_columns list")
+    missing_features = [col for col in value.feature_columns if col not in panel.columns]
+    if missing_features:
+        raise ConfigError(f"Factor provider {provider_name!r} declared missing features: {missing_features}")
+    non_numeric = [col for col in value.feature_columns if not pd.api.types.is_numeric_dtype(panel[col])]
+    if non_numeric:
+        raise ConfigError(f"Factor provider {provider_name!r} features must be numeric: {non_numeric}")
+    if bool(optional_value(cfg or {}, ["data", "strict_point_in_time"], False)):
+        for column in ("available_date", "label_start_date", "label_end_date"):
+            if column not in panel.columns:
+                raise ConfigError(
+                    f"Strict point-in-time provider output is missing column: {column}"
+                )
+    value.metadata = dict(value.metadata or {})
+    value.metadata.setdefault("factor_provider", provider_name)
+    value.warnings = list(value.warnings or [])
+    return value
+
+
+def build_panel(cfg: Mapping[str, Any]) -> PanelData:
+    """Load a canonical panel through the configured factor provider."""
+    from extension_registry import REGISTRY
+    from plugin_loader import ensure_builtin_extensions, factor_provider_config
+
+    ensure_builtin_extensions()
+    provider_cfg = factor_provider_config(cfg)
+    provider = REGISTRY.create_factor_provider(provider_cfg["name"], provider_cfg["params"])
+    data = _validate_panel_data(provider.load(cfg), provider_cfg["name"], cfg)
+    if str(cfg.get("_run_phase", "search")) == "search":
+        end_date = _effective_data_end(cfg)
+        if end_date not in (None, "") and int(data.panel["date"].max()) > int(end_date):
+            raise ConfigError(
+                f"Factor provider {provider_cfg['name']!r} returned rows beyond sealed search boundary"
+            )
+    return data
 
 
 def _normalize_config_date(value: Any, name: str) -> int:
@@ -399,6 +521,63 @@ def _build_fixed_train_valid_window(panel: pd.DataFrame, cfg: Mapping[str, Any],
     ]
 
 
+def _build_explicit_expanding_windows(
+    panel: pd.DataFrame,
+    cfg: Mapping[str, Any],
+    validation_cfg: Mapping[str, Any],
+) -> list[Window]:
+    raw_folds = validation_cfg.get("folds")
+    if not isinstance(raw_folds, list) or not raw_folds:
+        raise ConfigError("expanding_walk_forward validation.folds must be a non-empty list")
+    dates = sorted(int(x) for x in panel["date"].dropna().unique())
+    windows: list[Window] = []
+    previous_train_end: int | None = None
+    anchor_train_start: int | None = None
+    for window_id, raw_fold in enumerate(raw_folds):
+        if not isinstance(raw_fold, Mapping):
+            raise ConfigError("Each validation fold must be a mapping")
+        train_start = _normalize_config_date(
+            raw_fold.get("train_start", validation_cfg.get("train_start")),
+            f"folds[{window_id}].train_start",
+        )
+        train_end = _normalize_config_date(raw_fold.get("train_end"), f"folds[{window_id}].train_end")
+        valid_start = _normalize_config_date(raw_fold.get("valid_start"), f"folds[{window_id}].valid_start")
+        valid_end = _normalize_config_date(raw_fold.get("valid_end"), f"folds[{window_id}].valid_end")
+        embargo_n = int(raw_fold.get("embargo_days", validation_cfg.get("embargo_days", 0)))
+        _validate_embargo(cfg, embargo_n)
+        if not train_start <= train_end < valid_start <= valid_end:
+            raise ConfigError(f"Invalid expanding fold order at index {window_id}")
+        if previous_train_end is not None and train_end <= previous_train_end:
+            raise ConfigError("expanding_walk_forward train_end must increase across folds")
+        if anchor_train_start is None:
+            anchor_train_start = train_start
+        elif train_start != anchor_train_start:
+            raise ConfigError(
+                "expanding_walk_forward train_start must remain anchored across folds"
+            )
+        train_dates = _dates_between(dates, train_start, train_end, f"fold {window_id} train")
+        valid_dates = _dates_between(dates, valid_start, valid_end, f"fold {window_id} validation")
+        gap_dates = [date for date in dates if train_end < date < valid_start]
+        if len(gap_dates) < embargo_n:
+            raise ConfigError(
+                f"expanding fold {window_id} violates embargo: "
+                f"gap_dates={len(gap_dates)}, required={embargo_n}"
+            )
+        windows.append(
+            Window(
+                window_id=window_id,
+                train_start=train_dates[0],
+                train_end=train_dates[-1],
+                valid_start=valid_dates[0],
+                valid_end=valid_dates[-1],
+                train_dates=train_dates,
+                valid_dates=valid_dates,
+            )
+        )
+        previous_train_end = train_end
+    return windows
+
+
 def build_holdout_test_window(panel: pd.DataFrame, cfg: Mapping[str, Any]) -> Window | None:
     validation_cfg = require_mapping(cfg, ["validation"])
     if validation_cfg.get("method") != "fixed_train_valid_test":
@@ -435,8 +614,12 @@ def build_windows(panel: pd.DataFrame, cfg: Mapping[str, Any]) -> list[Window]:
     method = str(validation_cfg.get("method"))
     if method == "fixed_train_valid_test":
         return _build_fixed_train_valid_window(panel, cfg, validation_cfg)
-    if method != "walk_forward":
-        raise ConfigError("validation.method must be one of: walk_forward, fixed_train_valid_test")
+    if method == "expanding_walk_forward" and validation_cfg.get("folds"):
+        return _build_explicit_expanding_windows(panel, cfg, validation_cfg)
+    if method not in {"walk_forward", "expanding_walk_forward"}:
+        raise ConfigError(
+            "validation.method must be one of: walk_forward, expanding_walk_forward, fixed_train_valid_test"
+        )
     if validation_cfg.get("window_unit") != "trading_days":
         raise ConfigError("validation.window_unit must be explicitly set to trading_days")
 
@@ -468,8 +651,12 @@ def build_windows(panel: pd.DataFrame, cfg: Mapping[str, Any]) -> list[Window]:
     start = 0
     window_id = 0
     while start + train_n + embargo_n + valid_n <= len(dates):
-        train_dates = tuple(dates[start : start + train_n])
-        valid_start_idx = start + train_n + embargo_n
+        if method == "expanding_walk_forward":
+            train_dates = tuple(dates[: start + train_n])
+            valid_start_idx = start + train_n + embargo_n
+        else:
+            train_dates = tuple(dates[start : start + train_n])
+            valid_start_idx = start + train_n + embargo_n
         valid_dates = tuple(dates[valid_start_idx : valid_start_idx + valid_n])
         windows.append(
             Window(

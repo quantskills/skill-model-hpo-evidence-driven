@@ -70,6 +70,12 @@ def _resolve_config_paths(cfg: dict[str, Any], base_dir: Path) -> dict[str, Any]
         for key in PATH_KEYS:
             if key in section:
                 section[key] = _resolve_relative_path(section[key], base_dir)
+    extensions = out.get("extensions")
+    if isinstance(extensions, dict) and isinstance(extensions.get("plugin_roots"), list):
+        extensions["plugin_roots"] = [
+            _resolve_relative_path(value, base_dir)
+            for value in extensions["plugin_roots"]
+        ]
     return out
 
 

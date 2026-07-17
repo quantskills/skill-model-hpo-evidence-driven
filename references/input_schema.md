@@ -12,9 +12,13 @@ The JSON file may contain wrapper fields plus a native config object:
 {
   "output_root": "../outputs/my_run",
   "config": {
+    "compatibility": {"profile": "legacy_v1"},
     "task": {},
     "input": {},
     "data": {},
+    "features": {},
+    "model": {},
+    "extensions": {},
     "search": {},
     "validation": {},
     "evaluation": {},
@@ -25,7 +29,23 @@ The JSON file may contain wrapper fields plus a native config object:
 }
 ```
 
-Relative paths in `input` and `data` are resolved relative to the JSON file location.
+Relative paths in `input` and `data` are resolved relative to the JSON file location. Paths in `extensions.plugin_roots` are resolved the same way.
+
+## Compatibility Profiles
+
+`compatibility.profile` controls methodology defaults while leaving the extensible code framework unchanged:
+
+| Default | `legacy_v1` | `research_v2` |
+| --- | --- | --- |
+| Objective | `rankic_ir` | `robust_rankic` |
+| Metric policy | pooled overfit and continuous turnover | cross-sectional overfit and window-reset turnover |
+| Trial seed | `seed + trial_index * 997` | common seed for every initial trial |
+| Date sample weight | `none` | `equal_date` |
+| Multi-seed confirmation | disabled | enabled |
+| Point-in-time strictness | disabled | enabled |
+| Fixed test/holdout | evaluated automatically | sealed during search |
+
+The profile defaults to `legacy_v1` so existing experiments reproduce the prior settings. Explicit fields such as `evaluation.objective`, `training.sample_weight`, `reproducibility`, `data.strict_point_in_time`, and `holdout.mode` override profile defaults. Do not mix overrides when exact historical reproduction is required.
 
 ## Required Data Files
 
@@ -60,11 +80,30 @@ Optional point-in-time metadata:
 - `feature_exclude`: optional factor exclusions
 - `all_null_feature_policy`: `allow`, `drop`, or `raise`
 - `compute_hash`: whether to hash input files in metadata
+- `provider`: optional `{name, params}` factor-provider selection; defaults to `file_panel`
+- `strict_point_in_time`: defaults to `false` in `legacy_v1` and `true` in `research_v2`; strict mode requires `available_date`, `label_start_date`, `label_end_date`, and `universe_path`
+
+`features`:
+
+- `pipeline`: optional `{name, params}` feature-pipeline selection; defaults to `cross_sectional`
+
+`model`:
+
+- `type`: built-in or registered model name
+- `plugin`: optional explicit registered model name; when set, it is authoritative
+
+`extensions`:
+
+- `allow_external`: must be `true` before local user modules can be imported
+- `plugin_roots`: explicit allowed local module directories
+- `modules`: explicit module names exposing `register(registry)`
+
+See `extension_api.md` and `examples/hpo_custom_extension_smoke.json`. Existing configurations that omit these sections keep the original file/LGBM/MLP behavior.
 
 `search`:
 
-- `model_type`: `lgbm` or `mlp`
-- `method`: `evidence_driven` or `grid`; legacy aliases `adaptive_tpe` and `fixed_grid` are still accepted
+- `model_type`: `lgbm`, `mlp`, or the canonical name of an explicitly registered model plugin
+- `method`: `evidence_driven` or `grid`; legacy aliases remain accepted
 - `sampler`: for `evidence_driven`, use `evidence_probe`, `adaptive`, `structured_probe`, or `local_probe`; for `grid`, this is forced to `grid`
 - `max_trials`: total trial budget
 - `max_rounds`: maximum search rounds
@@ -75,9 +114,11 @@ Optional point-in-time metadata:
 - `grid`: generated-grid settings when `method=grid`
 - `grid_trials`: optional explicit parameter list when `method=grid`; takes precedence over generated `grid`
 
+Custom model plugins support `sampler=adaptive` or `method=grid`. Structured probe samplers remain specific to built-in LGBM/MLP parameter semantics.
+
 Search methods:
 
-- `evidence_driven`: samples parameters from `search.space`, records trial evidence, and optionally lets the decision provider adapt the search space between rounds.
+- `evidence_driven`: uses the built-in `adaptive_top_fraction` heuristic, records trial evidence, and optionally lets the decision provider adapt the search space between rounds. It is not a probabilistic TPE implementation.
 - `grid`: evaluates a deterministic sequence of parameter points. It does not call the decision provider and automatically disables `space_controller`.
 
 Generated grid config:
@@ -121,6 +162,24 @@ Search-space spec types:
 
 - `fixed_train_valid_test`: explicit train, validation, and holdout test dates
 - `walk_forward`: rolling train/validation windows using trading-day counts
+- `expanding_walk_forward`: anchored growing training windows, either count-based or explicit `folds`
+
+Explicit expanding folds:
+
+```yaml
+validation:
+  method: expanding_walk_forward
+  embargo_days: 5
+  folds:
+    - {train_start: 20150101, train_end: 20181231, valid_start: 20190101, valid_end: 20191231}
+    - {train_start: 20150101, train_end: 20191231, valid_start: 20200101, valid_end: 20201231}
+    - {train_start: 20150101, train_end: 20201231, valid_start: 20210101, valid_end: 20211231}
+    - {train_start: 20150101, train_end: 20211231, valid_start: 20220101, valid_end: 20221231}
+time:
+  locked_test_start: 20230101
+```
+
+Training rows are additionally purged when their actual `label_end_date >= valid_start`.
 
 For `fixed_train_valid_test`, define:
 
@@ -132,9 +191,53 @@ For `fixed_train_valid_test`, define:
 
 `evaluation.objective` can be:
 
-- `rankic_ir`: recommended for rank-oriented quant model search
+- `rankic_ir`: `legacy_v1` default; mean daily RankIC divided by its standard deviation
+- `robust_rankic`: `research_v2` default; block mean RankIC minus a standard-error penalty
 - `rmse`: optimize prediction loss directly
 - `fast_score`: weighted composite score
+
+Recommended robust objective:
+
+```yaml
+evaluation:
+  objective: robust_rankic
+  robust_rankic:
+    block: month
+    min_valid_dates: 60
+    min_blocks: 6
+    se_multiplier: 1.0
+```
+
+`training`:
+
+- `label_transform.method`: `none`, `rank_by_date`, or `zscore_by_date`
+- `sample_weight.method`: `none` in `legacy_v1`, `equal_date` in `research_v2`
+
+`reproducibility`:
+
+```yaml
+reproducibility:
+  trial_seed_policy: common
+  confirmation:
+    enabled: true
+    top_k: 3
+    seeds: [42, 137, 2027]
+    selection: mean_minus_std
+    std_penalty: 0.5
+    min_successful_seeds: 3
+```
+
+`legacy_v1` uses `trial_seed_policy=legacy_trial_index` and disables confirmation. `research_v2` uses a common initial seed, then reruns Top K candidates across the listed confirmation seeds.
+
+## Holdout Access
+
+`legacy_v1` automatically evaluates a configured fixed test period and returns `status=evaluated`. `research_v2` truncates search data at `validation.valid_end` or `time.locked_test_start`, returns `status=selected_not_tested`, and evaluates a frozen result separately:
+
+```bash
+python scripts/run_holdout_evaluation.py \
+  --source-run-dir <run-dir> \
+  --confirm-holdout-access
+```
 
 
 ## Decision Provider

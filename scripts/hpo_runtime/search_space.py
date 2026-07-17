@@ -9,38 +9,15 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from config_utils import ConfigError, optional_value
+from builtin_extensions import LGBM_SEARCH_SPACE, MLP_SEARCH_SPACE
+from config_utils import ConfigError
+from extension_registry import REGISTRY
+from plugin_loader import ensure_builtin_extensions, model_plugin_name
 
 
 DEFAULT_SEARCH_SPACES: dict[str, dict[str, dict[str, Any]]] = {
-    "lgbm": {
-        "num_leaves": {"type": "choice", "values": [15, 31, 63]},
-        "max_depth": {"type": "choice", "values": [-1, 4, 6, 8]},
-        "learning_rate": {"type": "loguniform", "low": 0.005, "high": 0.08},
-        "n_estimators": {"type": "choice", "values": [80, 150, 300]},
-        "min_child_samples": {"type": "choice", "values": [30, 80, 150, 300]},
-        "subsample": {"type": "uniform", "low": 0.6, "high": 1.0},
-        "colsample_bytree": {"type": "uniform", "low": 0.5, "high": 1.0},
-        "lambda_l1": {"type": "loguniform", "low": 1e-6, "high": 10.0},
-        "lambda_l2": {"type": "loguniform", "low": 1e-6, "high": 20.0},
-        "min_split_gain": {"type": "choice", "values": [0.0, 0.01, 0.05]},
-    },
-    "mlp": {
-        "hidden_layers": {"type": "choice", "values": [[64], [128], [128, 64], [256, 128]]},
-        "activation": {"type": "choice", "values": ["relu", "gelu", "silu"]},
-        "dropout": {"type": "uniform", "low": 0.0, "high": 0.3},
-        "learning_rate": {"type": "loguniform", "low": 1e-4, "high": 3e-3},
-        "weight_decay": {"type": "loguniform", "low": 1e-6, "high": 1e-2},
-        "batch_size": {"type": "choice", "values": [512, 1024, 2048, 4096]},
-        "max_epochs": {"type": "choice", "values": [5, 10, 20]},
-        "gradient_clip_norm": {"type": "choice", "values": [0.0, 1.0, 5.0]},
-    },
-}
-
-
-INTEGER_PARAMS = {
-    "lgbm": {"num_leaves", "max_depth", "n_estimators", "min_child_samples"},
-    "mlp": {"batch_size", "max_epochs"},
+    "lgbm": LGBM_SEARCH_SPACE,
+    "mlp": MLP_SEARCH_SPACE,
 }
 
 NUMERIC_TYPES = {"uniform", "loguniform", "quniform", "qloguniform"}
@@ -49,11 +26,8 @@ MLP_PROBE_SEQUENCE = ["center", "high_capacity", "low_capacity", "strong_regular
 
 
 def resolve_model_type(cfg: Mapping[str, Any]) -> str:
-    model_type = str(optional_value(cfg, ["search", "model_type"], "lgbm")).lower()
-    aliases = {"lightgbm": "lgbm", "lgbm": "lgbm", "mlp": "mlp"}
-    if model_type not in aliases:
-        raise ConfigError("search.model_type must be one of: lgbm, lightgbm, mlp")
-    return aliases[model_type]
+    ensure_builtin_extensions()
+    return REGISTRY.canonical_model_name(model_plugin_name(cfg))
 
 
 def resolve_search_space(cfg: Mapping[str, Any], model_type: str) -> dict[str, dict[str, Any]]:
@@ -66,7 +40,8 @@ def resolve_search_space(cfg: Mapping[str, Any], model_type: str) -> dict[str, d
             raise ConfigError("search.space must be a mapping")
         space = copy.deepcopy(dict(configured))
     else:
-        space = copy.deepcopy(DEFAULT_SEARCH_SPACES[model_type])
+        ensure_builtin_extensions()
+        space = copy.deepcopy(REGISTRY.get_model_plugin(model_type).default_search_space())
     fixed_params = search_cfg.get("fixed_params") or {}
     if fixed_params:
         if not isinstance(fixed_params, Mapping):
@@ -104,29 +79,8 @@ def validate_search_space(space: Mapping[str, Any]) -> None:
 
 
 def normalize_model_params(model_type: str, params: Mapping[str, Any]) -> dict[str, Any]:
-    out = dict(params)
-    if model_type == "lgbm":
-        for key in INTEGER_PARAMS["lgbm"]:
-            if key in out:
-                out[key] = int(out[key])
-        out["objective"] = "regression"
-        out["metric"] = "rmse"
-        out.setdefault("n_jobs", 1)
-        out.setdefault("force_col_wise", True)
-        if "subsample" in out and float(out["subsample"]) < 1.0:
-            out.setdefault("subsample_freq", 1)
-    elif model_type == "mlp":
-        if "hidden_layers" in out:
-            out["hidden_layers"] = [int(x) for x in list(out["hidden_layers"])]
-        for key in INTEGER_PARAMS["mlp"]:
-            if key in out:
-                out[key] = int(out[key])
-        for key in ("dropout", "learning_rate", "weight_decay", "gradient_clip_norm"):
-            if key in out:
-                out[key] = float(out[key])
-    else:
-        raise ConfigError(f"Unsupported model type: {model_type}")
-    return out
+    ensure_builtin_extensions()
+    return REGISTRY.get_model_plugin(model_type).normalize_params(params)
 
 
 def sample_params(
@@ -176,7 +130,12 @@ def sample_params_with_metadata(
     method = method.lower()
     sampler = str(sampler or "adaptive").lower()
     ok_history = [row for row in history if row.get("status") == "ok" and np.isfinite(float(row.get("score", np.nan)))]
-    use_adaptive = method in {"adaptive_tpe", "tpe", "tpe_like"} and len(ok_history) >= random_start_trials
+    use_adaptive = method in {
+        "adaptive_top_fraction",
+        "adaptive_tpe",
+        "tpe",
+        "tpe_like",
+    } and len(ok_history) >= random_start_trials
     top_rows = _top_rows(ok_history, top_fraction) if use_adaptive else []
     use_probe = (
         sampler in {"evidence_probe", "structured_probe", "local_probe"}
@@ -198,7 +157,7 @@ def sample_params_with_metadata(
         name: _sample_one(name, spec, rng, top_rows if use_adaptive else [])
         for name, spec in space.items()
     }
-    fallback_sampler = "adaptive_tpe_style" if use_adaptive else "random"
+    fallback_sampler = "adaptive_top_fraction" if use_adaptive else "random"
     return normalize_model_params(model_type, params), {
         "sampler": fallback_sampler if sampler == "adaptive" else sampler,
         "probe_applied": False,

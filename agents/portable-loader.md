@@ -20,7 +20,7 @@
 
 ## 用途
 
-本仓库提供一个可移植的 Skill 入口，用于对本地因子和标签数据运行 LGBM / MLP 模型超参数搜索，支持 evidence-driven LLM 搜索空间调整和确定性 grid search。
+本仓库提供一个可移植的 Skill 入口，用于对本地或用户适配的因子和标签数据运行内置 LGBM/MLP 或显式注册模型的超参数搜索，支持 evidence-driven LLM 搜索空间调整和确定性 grid search。
 
 ## 运行入口
 
@@ -46,10 +46,12 @@ python scripts/run_offline_final_selection.py --source-run-dir <run-dir> --outpu
 
 1. 按照 `references/input_schema.md` 准备输入 JSON。
 2. 通过 `feature_path` 和 `label_path` 提供本地因子与标签文件。
-3. 设置 `search.model_type` 为 `lgbm` 或 `mlp`。
+3. 设置 `search.model_type` 为 `lgbm`、`mlp` 或已注册模型名；自定义扩展先读取 `references/extension_api.md`。
 4. 设置 `search.method` 为 `evidence_driven` 或 `grid`。
 5. 如需 LLM decision 参与搜索空间调整，使用 `decision_provider.type=codex_external`，由外部 LLM/Agent 写入 decision JSON。
 6. 执行入口命令。
+7. 默认 `legacy_v1` 检查逐 trial seed、`rankic_ir` 和 `status=evaluated`；显式 `research_v2` 检查共同 seed、多 seed confirmation 和 `status=selected_not_tested`。
+8. `research_v2` 参数冻结后，使用独立 holdout 命令并显式确认测试集访问。
 
 ## LLM decision handoff
 
@@ -65,7 +67,15 @@ resolved_config.yaml
 trials.jsonl
 trial_leaderboard.csv
 best_params.json
+confirmation_seed_metrics.csv
+confirmation_leaderboard.csv
 search_report.md
+```
+
+Holdout 独立入口：
+
+```bash
+python scripts/run_holdout_evaluation.py --source-run-dir <run-dir> --confirm-holdout-access
 ```
 
 Grid search 额外输出：
@@ -82,6 +92,7 @@ grid_trials_resolved.json
 - `README.en.md`：英文说明文档。
 - `references/input_schema.md`：输入参数说明。
 - `references/output_contract.md`：输出文件和字段约定。
+- `references/extension_api.md`：用户 factor provider、feature pipeline 和 model plugin 接口。
 - `references/codex_external_workflow.md`：LLM decision handoff 说明。
 - `references/validation_notes.md`：验证边界和限制说明。
 

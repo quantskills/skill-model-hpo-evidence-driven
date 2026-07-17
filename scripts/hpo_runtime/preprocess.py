@@ -81,3 +81,34 @@ def preprocess_panel(
         out = _fillna(out, feature_columns, str(optional_value(cfg, ["preprocess", "after_normalize_fillna"], "none")))
     out = out.replace([np.inf, -np.inf], np.nan)
     return out
+
+
+def preprocess_features(
+    features: pd.DataFrame,
+    context: pd.DataFrame,
+    feature_columns: list[str],
+    cfg: Mapping[str, Any],
+    normalize_method: str | None = None,
+    preserve_nan: bool = False,
+) -> pd.DataFrame:
+    """Preprocess features using date context without exposing any target."""
+    required_context = {"date", "ticker"}
+    missing_context = sorted(required_context - set(context.columns))
+    if missing_context:
+        raise ConfigError(f"Feature context is missing columns: {missing_context}")
+    missing_features = [column for column in feature_columns if column not in features.columns]
+    if missing_features:
+        raise ConfigError(f"Feature frame is missing columns: {missing_features}")
+    if len(features) != len(context):
+        raise ConfigError("Feature frame and context must have the same row count")
+    panel = context[["date", "ticker"]].reset_index(drop=True).copy()
+    panel["y"] = 0.0
+    panel[feature_columns] = features[feature_columns].reset_index(drop=True)
+    processed = preprocess_panel(
+        panel,
+        feature_columns,
+        cfg,
+        normalize_method=normalize_method,
+        preserve_nan=preserve_nan,
+    )
+    return processed[feature_columns].set_axis(features.index)

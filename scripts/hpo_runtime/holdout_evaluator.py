@@ -24,7 +24,7 @@ def evaluate_holdout(
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     spec = ModelSpec(
         name=f"{model_type}_final_holdout",
-        type="lightgbm" if model_type == "lgbm" else model_type,
+        type=model_type,
         params=dict(params),
     )
     predictions, window_metrics = train_and_predict(

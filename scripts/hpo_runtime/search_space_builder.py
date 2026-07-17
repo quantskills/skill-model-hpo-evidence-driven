@@ -6,6 +6,8 @@ import copy
 from typing import Any, Mapping
 
 from config_utils import ConfigError
+from extension_registry import REGISTRY
+from plugin_loader import ensure_builtin_extensions
 from search_space import validate_search_space
 
 
@@ -88,6 +90,8 @@ def build_search_plan(
     overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     budget = resolve_budget(budget)
+    ensure_builtin_extensions()
+    model_type = REGISTRY.canonical_model_name(model_type)
     feature = profile.get("feature") or {}
     missing_rate = float(feature.get("sample_missing_rate") or 0.0)
     if model_type == "lgbm":
@@ -95,7 +99,7 @@ def build_search_plan(
     elif model_type == "mlp":
         space = _mlp_space(budget)
     else:
-        raise ConfigError(f"SearchSpaceBuilder supports lgbm/mlp, got: {model_type}")
+        space = REGISTRY.get_model_plugin(model_type).default_search_space()
     plan = dict(BUDGET_PRESETS[budget])
     plan.update({
         "model_type": model_type,

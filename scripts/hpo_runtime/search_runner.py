@@ -27,6 +27,11 @@ from holdout_evaluator import evaluate_holdout
 from llm_controller import llm_enabled
 from llm_space_decider import build_decision_memory_item
 from model_registry import ModelSpec
+from plugin_loader import (
+    configure_extensions,
+    factor_provider_config,
+    feature_pipeline_config,
+)
 from final_selector import (
     build_final_selection_evidence,
     build_neighbor_plan,
@@ -126,6 +131,18 @@ def _resolve_weights(cfg: Mapping[str, Any]) -> dict[str, float]:
 
 def _resolve_core_config(raw_cfg: Mapping[str, Any]) -> dict[str, Any]:
     cfg = dict(raw_cfg)
+    compatibility_cfg = dict(_mapping(raw_cfg.get("compatibility")))
+    compatibility_profile = str(
+        compatibility_cfg.get("profile", "legacy_v1")
+    ).strip().lower()
+    if compatibility_profile not in {"legacy_v1", "research_v2"}:
+        raise ConfigError(
+            "compatibility.profile must be one of: legacy_v1, research_v2"
+        )
+    compatibility_cfg["profile"] = compatibility_profile
+    cfg["compatibility"] = compatibility_cfg
+    legacy_mode = compatibility_profile == "legacy_v1"
+
     input_cfg = _mapping(raw_cfg.get("input"))
     data_cfg = dict(_mapping(raw_cfg.get("data")))
     if "feature_path" not in data_cfg and input_cfg.get("feature_path"):
@@ -141,6 +158,8 @@ def _resolve_core_config(raw_cfg: Mapping[str, Any]) -> dict[str, Any]:
     data_cfg.setdefault("read_chunksize", 500_000)
     data_cfg.setdefault("compute_hash", False)
     data_cfg.setdefault("all_null_feature_policy", "allow")
+    data_cfg.setdefault("strict_point_in_time", not legacy_mode)
+    data_cfg.setdefault("provider", {"name": "file_panel", "params": {}})
     cfg["data"] = data_cfg
 
     task_cfg = dict(_mapping(raw_cfg.get("task")))
@@ -149,14 +168,23 @@ def _resolve_core_config(raw_cfg: Mapping[str, Any]) -> dict[str, Any]:
     task_cfg.setdefault("seed", 42)
     cfg["task"] = task_cfg
 
-    model_cfg = _mapping(raw_cfg.get("model"))
+    model_cfg = dict(_mapping(raw_cfg.get("model")))
     search_cfg = dict(_mapping(raw_cfg.get("search")))
-    model_type = str(search_cfg.get("model_type") or model_cfg.get("type") or raw_cfg.get("model_type") or "lgbm").strip().lower()
+    model_type = str(
+        model_cfg.get("plugin")
+        or search_cfg.get("model_type")
+        or model_cfg.get("type")
+        or raw_cfg.get("model_type")
+        or "lgbm"
+    ).strip().lower()
     if model_type == "auto":
         model_type = "lgbm"
+    model_cfg.setdefault("type", model_type)
+    model_cfg.setdefault("plugin", model_type)
+    cfg["model"] = model_cfg
     search_cfg["model_type"] = model_type
     max_trials = int(search_cfg.get("max_trials", 20))
-    search_cfg.setdefault("method", "adaptive_tpe")
+    search_cfg.setdefault("method", "evidence_driven")
     search_cfg.setdefault("max_trials", max_trials)
     search_cfg.setdefault("max_rounds", 2)
     search_cfg.setdefault("trials_per_round", max_trials)
@@ -172,7 +200,11 @@ def _resolve_core_config(raw_cfg: Mapping[str, Any]) -> dict[str, Any]:
     validation_cfg.update(dict(_mapping(raw_cfg.get("validation"))))
     cfg["validation"] = validation_cfg
 
-    training_cfg = {"label_window": 5}
+    training_cfg = {
+        "label_window": 5,
+        "label_transform": {"method": "none"},
+        "sample_weight": {"method": "none" if legacy_mode else "equal_date"},
+    }
     training_cfg.update(dict(_mapping(raw_cfg.get("training"))))
     cfg["training"] = training_cfg
 
@@ -182,11 +214,51 @@ def _resolve_core_config(raw_cfg: Mapping[str, Any]) -> dict[str, Any]:
 
     evaluation_cfg = dict(_mapping(raw_cfg.get("evaluation")))
     evaluation_cfg.setdefault("inner_loop", "fast_evaluator")
-    evaluation_cfg.setdefault("objective", "rankic_ir")
+    evaluation_cfg.setdefault("objective", "rankic_ir" if legacy_mode else "robust_rankic")
+    evaluation_cfg.setdefault(
+        "metric_policy",
+        "legacy_pooled" if legacy_mode else "cross_sectional",
+    )
+    evaluation_cfg.setdefault(
+        "robust_rankic",
+        {
+            "block": "month",
+            "min_valid_dates": 60,
+            "min_blocks": 3,
+            "se_multiplier": 1.0,
+        },
+    )
     evaluation_cfg["fast_score_weights"] = _resolve_weights(cfg)
     cfg["evaluation"] = evaluation_cfg
     cfg["fast_evaluator"] = dict(_mapping(raw_cfg.get("fast_evaluator")) or {"top_quantile": 0.2, "bottom_quantile": 0.2})
     cfg["preprocess"] = dict(_mapping(raw_cfg.get("preprocess")) or DEFAULT_PREPROCESS)
+    features_cfg = dict(_mapping(raw_cfg.get("features")))
+    features_cfg.setdefault("pipeline", {"name": "cross_sectional", "params": {}})
+    cfg["features"] = features_cfg
+    cfg["extensions"] = dict(_mapping(raw_cfg.get("extensions")))
+    reproducibility_cfg = dict(_mapping(raw_cfg.get("reproducibility")))
+    reproducibility_cfg.setdefault(
+        "trial_seed_policy",
+        "legacy_trial_index" if legacy_mode else "common",
+    )
+    confirmation_cfg = dict(_mapping(reproducibility_cfg.get("confirmation")))
+    confirmation_cfg.setdefault("enabled", not legacy_mode)
+    confirmation_cfg.setdefault("top_k", 3)
+    confirmation_cfg.setdefault(
+        "seeds",
+        [int(task_cfg.get("seed", 42)), 137, 2027],
+    )
+    confirmation_cfg.setdefault("selection", "mean_minus_std")
+    confirmation_cfg.setdefault("std_penalty", 0.5)
+    confirmation_cfg.setdefault("min_successful_seeds", len(confirmation_cfg["seeds"]))
+    reproducibility_cfg["confirmation"] = confirmation_cfg
+    cfg["reproducibility"] = reproducibility_cfg
+    holdout_cfg = dict(_mapping(raw_cfg.get("holdout")))
+    holdout_cfg.setdefault("mode", "automatic" if legacy_mode else "sealed")
+    if str(holdout_cfg["mode"]).lower() not in {"automatic", "sealed"}:
+        raise ConfigError("holdout.mode must be one of: automatic, sealed")
+    holdout_cfg["mode"] = str(holdout_cfg["mode"]).lower()
+    cfg["holdout"] = holdout_cfg
     cfg["space_controller"] = dict(_mapping(raw_cfg.get("space_controller")) or {"enabled": True, "mode": "rule"})
     cfg["llm"] = dict(_mapping(raw_cfg.get("llm")) or {"enabled": False})
     cfg["decision_provider"] = dict(_mapping(raw_cfg.get("decision_provider")) or {})
@@ -339,6 +411,7 @@ def _render_search_report(path: Path, summary: Mapping[str, Any], leaderboard: p
     for key in [
         "run_id",
         "task_name",
+        "compatibility_profile",
         "model_type",
         "search_method",
         "sampler",
@@ -364,7 +437,7 @@ def _render_search_report(path: Path, summary: Mapping[str, Any], leaderboard: p
     lines.append("")
     lines.append("## Top Trials")
     ok = leaderboard[leaderboard["status"] == "ok"].sort_values("score", ascending=False).head(10)
-    cols = [c for c in ["trial_id", "sampler", "probe_type", "score", "loss", "valid_rmse", "valid_mae", "valid_r2", "fast_score", "mean_rankic", "rankic_ir", "top_bottom_spread", "positive_window_ratio", "turnover_proxy", "overfit_penalty", "complexity_penalty"] if c in ok]
+    cols = [c for c in ["trial_id", "sampler", "probe_type", "score", "loss", "robust_rankic", "mean_rankic", "block_rankic_std", "positive_block_ratio", "valid_rmse", "valid_mae", "valid_r2", "fast_score", "rankic_ir", "top_bottom_spread", "positive_window_ratio", "turnover_proxy", "overfit_penalty", "complexity_penalty"] if c in ok]
     if ok.empty or not cols:
         lines.append("No successful trials.")
     else:
@@ -395,7 +468,16 @@ def _render_search_report(path: Path, summary: Mapping[str, Any], leaderboard: p
     else:
         lines.append("- no controller decision was recorded")
     lines.append("")
-    lines.append("Search trials are scored by validation metrics only; holdout test metrics are reported after hyperparameter selection and are not fed back into the controller.")
+    if summary.get("holdout_mode") == "automatic":
+        lines.append(
+            "Legacy compatibility mode evaluates the configured fixed test period "
+            "automatically after parameter selection."
+        )
+    else:
+        lines.append(
+            "Search trials use validation data only. Holdout rows are sealed and must be "
+            "evaluated later with the explicit run_holdout_evaluation.py command."
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -413,14 +495,26 @@ def _run_one_trial(
 ) -> tuple[dict[str, Any], pd.DataFrame | None, pd.DataFrame | None]:
     row = _status_row_base(trial_id, trial_index, model_type, params)
     try:
-        spec = ModelSpec(name=trial_id, type="lightgbm" if model_type == "lgbm" else model_type, params=params)
+        seed_policy = str(
+            optional_value(
+                cfg,
+                ["reproducibility", "trial_seed_policy"],
+                "legacy_trial_index",
+            )
+        ).lower()
+        model_seed = (
+            seed + trial_index * 997
+            if seed_policy == "legacy_trial_index"
+            else seed
+        )
+        spec = ModelSpec(name=trial_id, type=model_type, params=params)
         predictions, window_metrics = train_and_predict(
             panel_data.panel,
             panel_data.feature_columns,
             windows,
             [spec],
             cfg,
-            seed=seed + trial_index * 997,
+            seed=model_seed,
             normalize_method=str(normalize_method) if normalize_method else None,
         )
         duplicates = int(predictions.duplicated(["model_name", "date", "ticker"]).sum())
@@ -454,6 +548,14 @@ def _run_one_trial(
             "complexity_penalty": best_summary.get("complexity_penalty"),
             "overfit_penalty": best_summary.get("overfit_penalty"),
             "num_prediction_rows": int(best_summary.get("num_prediction_rows", len(predictions))),
+            "model_seed": int(model_seed),
+            "robust_rankic": best_summary.get("robust_rankic"),
+            "num_valid_dates": best_summary.get("num_valid_dates"),
+            "num_rankic_blocks": best_summary.get("num_rankic_blocks"),
+            "block_rankic_mean": best_summary.get("block_rankic_mean"),
+            "block_rankic_std": best_summary.get("block_rankic_std"),
+            "block_rankic_se": best_summary.get("block_rankic_se"),
+            "positive_block_ratio": best_summary.get("positive_block_ratio"),
         })
         window_metrics = window_metrics.copy()
         window_metrics.insert(0, "trial_id", trial_id)
@@ -464,9 +566,128 @@ def _run_one_trial(
         return row, None, None
 
 
+def _run_seed_confirmation(
+    *,
+    trial_history: list[dict[str, Any]],
+    initially_selected: Mapping[str, Any],
+    model_type: str,
+    panel_data: Any,
+    windows: list[Any],
+    cfg: Mapping[str, Any],
+    normalize_method: Any,
+    run_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    confirmation_cfg = dict(
+        _mapping(_mapping(cfg.get("reproducibility")).get("confirmation"))
+    )
+    if not bool(confirmation_cfg.get("enabled", True)):
+        return dict(initially_selected), {"enabled": False}
+    seeds = [int(value) for value in list(confirmation_cfg.get("seeds") or [])]
+    if not seeds:
+        raise ConfigError("reproducibility.confirmation.seeds must not be empty")
+    top_k = int(confirmation_cfg.get("top_k", 3))
+    min_successful = int(confirmation_cfg.get("min_successful_seeds", len(seeds)))
+    if not 1 <= min_successful <= len(seeds):
+        raise ConfigError(
+            "reproducibility.confirmation.min_successful_seeds must be within seed count"
+        )
+    candidates = select_center_candidates(trial_history, top_k=top_k)
+    candidate_by_id = {str(row["trial_id"]): dict(row) for row in candidates}
+    initial_id = str(initially_selected.get("trial_id"))
+    if initial_id not in candidate_by_id:
+        candidate_by_id[initial_id] = dict(initially_selected)
+    seed_rows: list[dict[str, Any]] = []
+    confirmation_run_cfg = dict(cfg)
+    confirmation_reproducibility = dict(_mapping(cfg.get("reproducibility")))
+    confirmation_reproducibility["trial_seed_policy"] = "common"
+    confirmation_run_cfg["reproducibility"] = confirmation_reproducibility
+    for candidate_index, candidate in enumerate(candidate_by_id.values()):
+        source_trial_id = str(candidate["trial_id"])
+        for seed_index, model_seed in enumerate(seeds):
+            row, _, _ = _run_one_trial(
+                trial_id=f"confirm_{source_trial_id}_seed_{model_seed}",
+                trial_index=candidate_index * len(seeds) + seed_index,
+                model_type=model_type,
+                params=dict(candidate["params"]),
+                panel_data=panel_data,
+                windows=windows,
+                cfg=confirmation_run_cfg,
+                seed=model_seed,
+                normalize_method=normalize_method,
+            )
+            row["source_trial_id"] = source_trial_id
+            row["search_score"] = candidate.get("score")
+            seed_rows.append(row)
+    seed_frame = pd.DataFrame([_flatten_trial(row) for row in seed_rows])
+    seed_frame.to_csv(run_dir / "confirmation_seed_metrics.csv", index=False)
+    selection = str(confirmation_cfg.get("selection", "mean_minus_std")).lower()
+    std_penalty = float(confirmation_cfg.get("std_penalty", 0.5))
+    aggregate_rows: list[dict[str, Any]] = []
+    for source_trial_id, rows in pd.DataFrame(seed_rows).groupby("source_trial_id", sort=False):
+        ok = rows[rows["status"] == "ok"].copy()
+        scores = pd.to_numeric(ok.get("score"), errors="coerce").dropna()
+        if len(scores) < min_successful:
+            continue
+        score_mean = float(scores.mean())
+        score_std = float(scores.std(ddof=1)) if len(scores) > 1 else 0.0
+        if selection == "mean_minus_std":
+            confirmation_score = score_mean - std_penalty * score_std
+        elif selection == "mean":
+            confirmation_score = score_mean
+        elif selection == "median":
+            confirmation_score = float(scores.median())
+        else:
+            raise ConfigError(
+                "reproducibility.confirmation.selection must be one of: "
+                "mean_minus_std, mean, median"
+            )
+        aggregate_rows.append(
+            {
+                "source_trial_id": source_trial_id,
+                "num_successful_seeds": int(len(scores)),
+                "seed_scores": scores.tolist(),
+                "score_mean": score_mean,
+                "score_std": score_std,
+                "score_min": float(scores.min()),
+                "confirmation_score": confirmation_score,
+                "search_score": candidate_by_id[str(source_trial_id)].get("score"),
+            }
+        )
+    if not aggregate_rows:
+        raise ValueError("No candidate passed multi-seed confirmation")
+    confirmation_leaderboard = pd.DataFrame(aggregate_rows).sort_values(
+        "confirmation_score",
+        ascending=False,
+    )
+    confirmation_leaderboard.to_csv(
+        run_dir / "confirmation_leaderboard.csv",
+        index=False,
+    )
+    winner = confirmation_leaderboard.iloc[0].to_dict()
+    selected = dict(candidate_by_id[str(winner["source_trial_id"])])
+    selected["search_score"] = selected.get("score")
+    selected["score"] = float(winner["confirmation_score"])
+    selected["confirmation_score"] = float(winner["confirmation_score"])
+    selected["loss"] = -float(winner["confirmation_score"])
+    summary = {
+        "enabled": True,
+        "top_k": top_k,
+        "seeds": seeds,
+        "selection": selection,
+        "std_penalty": std_penalty,
+        "min_successful_seeds": min_successful,
+        "selected_trial_id": selected["trial_id"],
+        "selected_confirmation_score": selected["confirmation_score"],
+        "leaderboard": confirmation_leaderboard.to_dict(orient="records"),
+    }
+    write_json(summary, run_dir / "confirmation_summary.json")
+    return selected, summary
+
+
 def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
     raw_cfg = load_config(config_path)
     cfg = _resolve_core_config(raw_cfg)
+    extension_manifest = configure_extensions(cfg)
     _check_validation_overlap(cfg)
 
     task_name = str(optional_value(cfg, ["task", "name"], "evidence_adaptive_model_search"))
@@ -488,10 +709,18 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         method = "grid"
     if method == "grid":
         sampler = "grid"
-    sampling_method = "adaptive_tpe" if method == "evidence_driven" else method
+    sampling_method = "adaptive_top_fraction" if method == "evidence_driven" else method
     probe_fraction = float(search_cfg.get("probe_fraction", 0.0))
     normalize_method = search_cfg.get("normalize_method")
     seed = int(search_cfg.get("seed", optional_value(cfg, ["task", "seed"], 42)))
+    trial_seed_policy = str(
+        optional_value(cfg, ["reproducibility", "trial_seed_policy"], "common")
+    ).lower()
+    if trial_seed_policy not in {"common", "legacy_trial_index"}:
+        raise ConfigError(
+            "reproducibility.trial_seed_policy must be one of: "
+            "common, legacy_trial_index"
+        )
     max_rounds = int(search_cfg.get("max_rounds", 1))
     trials_per_round = int(search_cfg.get("trials_per_round", max_trials))
     if max_trials <= 0:
@@ -502,6 +731,8 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         raise ConfigError("search.max_rounds and search.trials_per_round must be positive")
     if sampler not in {"adaptive", "evidence_probe", "structured_probe", "local_probe", "grid"}:
         raise ConfigError("search.sampler must be one of: adaptive, evidence_probe, structured_probe, local_probe, grid")
+    if model_type not in {"lgbm", "mlp"} and sampler in {"evidence_probe", "structured_probe", "local_probe"}:
+        raise ConfigError("External model plugins currently support search.sampler=adaptive or grid")
     if not 0.0 <= probe_fraction <= 1.0:
         raise ConfigError("search.probe_fraction must be in [0, 1]")
     use_grid = method == "grid"
@@ -522,7 +753,18 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
 
     panel_data = build_panel(cfg)
     windows = build_windows(panel_data.panel, cfg)
-    holdout_window = build_holdout_test_window(panel_data.panel, cfg)
+    validation_cfg = _mapping(cfg.get("validation"))
+    holdout_mode = str(optional_value(cfg, ["holdout", "mode"], "automatic")).lower()
+    holdout_configured = bool(
+        validation_cfg.get("method") == "fixed_train_valid_test"
+        and validation_cfg.get("test_start") not in (None, "")
+        and validation_cfg.get("test_end") not in (None, "")
+    )
+    holdout_window = (
+        build_holdout_test_window(panel_data.panel, cfg)
+        if holdout_mode == "automatic" and holdout_configured
+        else None
+    )
     rng = np.random.default_rng(seed)
     use_llm = llm_enabled(cfg)
     controller_cfg = dict(_mapping(cfg.get("space_controller")))
@@ -541,6 +783,11 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
     manifest = {
         "run_id": run_id,
         "task_name": task_name,
+        "compatibility_profile": optional_value(
+            cfg,
+            ["compatibility", "profile"],
+            "legacy_v1",
+        ),
         "commit": _git_commit(Path(__file__).resolve().parent),
         "model_type": model_type,
         "search_method": method,
@@ -551,9 +798,9 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
             "grid"
             if use_grid
             else (
-                f"{sampler}_over_internal_adaptive_tpe_style"
+                f"{sampler}_over_adaptive_top_fraction"
                 if sampler in {"evidence_probe", "structured_probe", "local_probe"}
-                else ("internal_adaptive_tpe_style" if sampling_method in {"adaptive_tpe", "tpe", "tpe_like"} else "random")
+                else ("adaptive_top_fraction" if sampling_method == "adaptive_top_fraction" else "random")
             )
         ),
         "grid_enabled": use_grid,
@@ -567,16 +814,31 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         "llm_enabled": use_llm,
         "decision_provider_type": decision_provider_config.get("type"),
         "decision_provider": dict(decision_provider_config),
+        "extensions": extension_manifest,
+        "resolved_components": {
+            "factor_provider": factor_provider_config(cfg)["name"],
+            "feature_pipeline": feature_pipeline_config(cfg)["name"],
+            "model_plugin": model_type,
+        },
         "space_controller_enabled": use_space_controller,
         "space_controller_mode": controller_mode,
         "space_controller": dict(controller_cfg),
         "seed": seed,
+        "trial_seed_policy": trial_seed_policy,
+        "confirmation": dict(
+            _mapping(_mapping(cfg.get("reproducibility")).get("confirmation"))
+        ),
         "data_metadata": panel_data.metadata,
         "num_features": len(panel_data.feature_columns),
         "feature_columns": panel_data.feature_columns,
         "num_windows": len(windows),
-        "holdout_enabled": holdout_window is not None,
-        "holdout_window": holdout_window.to_dict() if holdout_window is not None else None,
+        "holdout_configured": holdout_configured,
+        "holdout_mode": holdout_mode,
+        "holdout_status": (
+            "automatic_pending"
+            if holdout_window is not None
+            else ("sealed_not_loaded" if holdout_configured else "not_configured")
+        ),
         "warnings": panel_data.warnings,
     }
     write_json(manifest, run_dir / "search_manifest.json")
@@ -729,6 +991,9 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
                 summary = {
                     "run_id": run_id,
                     "task_name": task_name,
+                    "compatibility_profile": optional_value(
+                        cfg, ["compatibility", "profile"], "legacy_v1"
+                    ),
                     "model_type": model_type,
                     "status": "external_decision_required",
                     "external_decision_required": requirement,
@@ -747,12 +1012,21 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
                     "llm_enabled": use_llm,
                     "decision_provider_type": decision_provider_config.get("type"),
                     "decision_provider": dict(decision_provider_config),
+                    "extensions": extension_manifest,
                     "space_controller_enabled": use_space_controller,
                     "space_controller_mode": controller_mode,
                     "space_controller_decisions": space_controller_decisions,
                     "decision_memory": decision_memory,
                     "num_space_versions": int(len(space_versions)),
                     "final_selector_enabled": bool(_mapping(cfg.get("final_selector")).get("enabled")),
+                    "holdout_configured": holdout_configured,
+                    "holdout_mode": holdout_mode,
+                    "holdout_status": (
+                        "automatic_pending"
+                        if holdout_window is not None
+                        else ("sealed_not_loaded" if holdout_configured else "not_configured")
+                    ),
+                    "holdout_metrics": None,
                     "diagnostics": diagnostics,
                     "data_metadata": panel_data.metadata,
                     "warnings": panel_data.warnings,
@@ -831,6 +1105,9 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         summary = {
             "run_id": run_id,
             "task_name": task_name,
+            "compatibility_profile": optional_value(
+                cfg, ["compatibility", "profile"], "legacy_v1"
+            ),
             "model_type": model_type,
             "status": "failed",
             "search_method": method,
@@ -846,12 +1123,21 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
             "num_failed_trials": num_failed_trials,
             "num_rounds": int(len(round_history)),
             "llm_enabled": use_llm,
+            "extensions": extension_manifest,
             "space_controller_enabled": use_space_controller,
             "space_controller_mode": controller_mode,
             "space_controller_decisions": space_controller_decisions,
             "decision_memory": decision_memory,
             "num_space_versions": int(len(space_versions)),
             "final_selector_enabled": bool(_mapping(cfg.get("final_selector")).get("enabled")),
+            "holdout_configured": holdout_configured,
+            "holdout_mode": holdout_mode,
+            "holdout_status": (
+                "automatic_not_evaluated"
+                if holdout_window is not None
+                else ("sealed_not_loaded" if holdout_configured else "not_configured")
+            ),
+            "holdout_metrics": None,
             "diagnostics": diagnostics,
             "data_metadata": panel_data.metadata,
             "warnings": panel_data.warnings,
@@ -981,6 +1267,9 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
             summary = {
                 "run_id": run_id,
                 "task_name": task_name,
+                "compatibility_profile": optional_value(
+                    cfg, ["compatibility", "profile"], "legacy_v1"
+                ),
                 "model_type": model_type,
                 "search_method": method,
                 "sampler": sampler,
@@ -999,6 +1288,7 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
                 "llm_enabled": use_llm,
                 "decision_provider_type": decision_provider_config.get("type"),
                 "decision_provider": dict(decision_provider_config),
+                "extensions": extension_manifest,
                 "space_controller_enabled": use_space_controller,
                 "space_controller_mode": controller_mode,
                 "space_controller_decisions": space_controller_decisions,
@@ -1010,7 +1300,13 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
                 "final_selector_enabled": bool(final_selector_cfg.get("enabled")),
                 "num_final_neighbor_trials": int(len(final_neighbor_rows)),
                 "final_selection": final_selection,
-                "holdout_enabled": holdout_window is not None,
+                "holdout_configured": holdout_configured,
+                "holdout_mode": holdout_mode,
+                "holdout_status": (
+                    "automatic_pending"
+                    if holdout_window is not None
+                    else ("sealed_not_loaded" if holdout_configured else "not_configured")
+                ),
                 "holdout_metrics": None,
                 "diagnostics": diagnostics,
                 "data_metadata": panel_data.metadata,
@@ -1040,8 +1336,22 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         pd.DataFrame().to_csv(run_dir / "final_neighbor_window_metrics.csv", index=False)
         write_json(final_selection, run_dir / "final_selection.json")
 
+    selected_trial, confirmation_summary = _run_seed_confirmation(
+        trial_history=trial_history,
+        initially_selected=selected_trial,
+        model_type=model_type,
+        panel_data=panel_data,
+        windows=windows,
+        cfg=cfg,
+        normalize_method=normalize_method,
+        run_dir=run_dir,
+    )
     validated_final_selection = dict(final_selection.get("validated_selection") or {})
-    selected_by = str(validated_final_selection.get("selected_by") or "score_best")
+    selected_by = (
+        "multi_seed_confirmation"
+        if confirmation_summary.get("enabled")
+        else str(validated_final_selection.get("selected_by") or "score_best")
+    )
     best_params = {
         "model_type": model_type,
         "selected_by": selected_by,
@@ -1050,6 +1360,9 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         "score_best_score": score_best_trial["score"],
         "objective": selected_trial.get("objective"),
         "score": selected_trial["score"],
+        "search_score": selected_trial.get("search_score", selected_trial["score"]),
+        "confirmation_score": selected_trial.get("confirmation_score"),
+        "confirmation": confirmation_summary,
         "loss": selected_trial["loss"],
         "valid_rmse": selected_trial.get("valid_rmse"),
         "valid_mae": selected_trial.get("valid_mae"),
@@ -1072,18 +1385,29 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
             normalize_method=str(normalize_method) if normalize_method else None,
         )
         write_json(holdout_summary, run_dir / "final_holdout_metrics.json")
-        holdout_predictions.to_csv(run_dir / "final_holdout_predictions.csv", index=False)
-        holdout_window_metrics.to_csv(run_dir / "final_holdout_window_metrics.csv", index=False)
+        holdout_predictions.to_csv(
+            run_dir / "final_holdout_predictions.csv",
+            index=False,
+        )
+        holdout_window_metrics.to_csv(
+            run_dir / "final_holdout_window_metrics.csv",
+            index=False,
+        )
 
     summary = {
         "run_id": run_id,
         "task_name": task_name,
+        "compatibility_profile": optional_value(
+            cfg,
+            ["compatibility", "profile"],
+            "legacy_v1",
+        ),
         "model_type": model_type,
         "search_method": method,
         "sampler": sampler,
         "probe_fraction": probe_fraction,
         "evaluation_objective": optional_value(cfg, ["evaluation", "objective"], "fast_score"),
-        "status": "evaluated",
+        "status": "evaluated" if holdout_window is not None else "selected_not_tested",
         "max_trials": max_trials,
         "grid_enabled": use_grid,
         "grid_manifest": grid_manifest,
@@ -1095,6 +1419,7 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         "llm_enabled": use_llm,
         "decision_provider_type": decision_provider_config.get("type"),
         "decision_provider": dict(decision_provider_config),
+        "extensions": extension_manifest,
         "space_controller_enabled": use_space_controller,
         "space_controller_mode": controller_mode,
         "space_controller_decisions": space_controller_decisions,
@@ -1104,13 +1429,20 @@ def run_search(config_path: Path, output_root: Path) -> dict[str, Any]:
         "best_trial_id": selected_trial["trial_id"],
         "best_score": selected_trial["score"],
         "best_params": selected_trial["params"],
+        "confirmation": confirmation_summary,
         "score_best_trial_id": score_best_trial["trial_id"],
         "score_best_score": score_best_trial["score"],
         "score_best_params": score_best_trial["params"],
         "final_selector_enabled": bool(final_selector_cfg.get("enabled")),
         "num_final_neighbor_trials": int(len(final_neighbor_rows)),
         "final_selection": final_selection,
-        "holdout_enabled": holdout_window is not None,
+        "holdout_configured": holdout_configured,
+        "holdout_mode": holdout_mode,
+        "holdout_status": (
+            "evaluated"
+            if holdout_window is not None
+            else ("sealed_not_loaded" if holdout_configured else "not_configured")
+        ),
         "holdout_metrics": holdout_summary,
         "diagnostics": diagnostics,
         "data_metadata": panel_data.metadata,

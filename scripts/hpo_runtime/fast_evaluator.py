@@ -43,18 +43,31 @@ def top_bottom_spread(frame: pd.DataFrame, pred_col: str, y_col: str, top_q: flo
     return pd.Series(values, dtype="float64")
 
 
-def turnover_proxy(frame: pd.DataFrame, pred_col: str, top_q: float, min_assets: int) -> float:
-    previous: set[Any] | None = None
+def turnover_proxy(
+    frame: pd.DataFrame,
+    pred_col: str,
+    top_q: float,
+    min_assets: int,
+    *,
+    reset_at_window: bool = True,
+) -> float:
     turnovers: list[float] = []
-    for _, group in frame[["date", "ticker", pred_col]].groupby("date", sort=True):
-        data = group[["ticker", pred_col]].dropna()
-        if len(data) < min_assets:
-            continue
-        high = data[pred_col].quantile(1.0 - top_q)
-        current = set(data.loc[data[pred_col] >= high, "ticker"].tolist())
-        if previous is not None and current:
-            turnovers.append(1.0 - len(previous & current) / max(len(current), 1))
-        previous = current
+    window_groups = (
+        frame.groupby("window_id", sort=True)
+        if reset_at_window and "window_id" in frame
+        else [(0, frame)]
+    )
+    for _, window_frame in window_groups:
+        previous: set[Any] | None = None
+        for _, group in window_frame[["date", "ticker", pred_col]].groupby("date", sort=True):
+            data = group[["ticker", pred_col]].dropna()
+            if len(data) < min_assets:
+                continue
+            high = data[pred_col].quantile(1.0 - top_q)
+            current = set(data.loc[data[pred_col] >= high, "ticker"].tolist())
+            if previous is not None and current:
+                turnovers.append(1.0 - len(previous & current) / max(len(current), 1))
+            previous = current
     return float(np.nanmean(turnovers)) if turnovers else 0.0
 
 
@@ -78,11 +91,69 @@ SUPPORTED_OBJECTIVES = {
     "rankic_ir",
     "top_bottom_spread",
     "positive_window_ratio",
+    "robust_rankic",
 }
 
 
 def finite_or_zero(value: float) -> float:
     return float(value) if np.isfinite(value) else 0.0
+
+
+def _rankic_blocks(
+    group: pd.DataFrame,
+    rankic: pd.Series,
+    block_method: str,
+) -> pd.Series:
+    if rankic.empty:
+        return pd.Series(dtype="float64")
+    dates = pd.Series(rankic.index.astype("int64"), index=rankic.index)
+    if block_method == "month":
+        labels = dates // 100
+    elif block_method == "year":
+        labels = dates // 10_000
+    elif block_method == "window":
+        if "window_id" not in group:
+            labels = pd.Series(0, index=rankic.index)
+        else:
+            date_to_window = (
+                group[["date", "window_id"]]
+                .drop_duplicates("date")
+                .set_index("date")["window_id"]
+            )
+            labels = pd.Series(rankic.index.map(date_to_window), index=rankic.index)
+    else:
+        raise ConfigError("evaluation.robust_rankic.block must be one of: month, year, window")
+    return rankic.groupby(labels).mean().dropna()
+
+
+def _robust_rankic_score(
+    group: pd.DataFrame,
+    rankic: pd.Series,
+    cfg: Mapping[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    robust_cfg = optional_value(cfg, ["evaluation", "robust_rankic"], {})
+    if not isinstance(robust_cfg, Mapping):
+        raise ConfigError("evaluation.robust_rankic must be a mapping")
+    min_valid_dates = int(robust_cfg.get("min_valid_dates", 60))
+    min_blocks = int(robust_cfg.get("min_blocks", 3))
+    block_method = str(robust_cfg.get("block", "month")).lower()
+    se_multiplier = float(robust_cfg.get("se_multiplier", 1.0))
+    blocks = _rankic_blocks(group, rankic, block_method)
+    enough = len(rankic) >= min_valid_dates and len(blocks) >= min_blocks
+    block_mean = float(blocks.mean()) if not blocks.empty else float("nan")
+    block_std = float(blocks.std(ddof=1)) if len(blocks) > 1 else 0.0
+    block_se = block_std / float(np.sqrt(len(blocks))) if len(blocks) else float("nan")
+    robust_score = block_mean - se_multiplier * block_se if enough else float("nan")
+    return robust_score, {
+        "num_valid_dates": int(len(rankic)),
+        "num_rankic_blocks": int(len(blocks)),
+        "rankic_block_method": block_method,
+        "block_rankic_mean": block_mean,
+        "block_rankic_std": block_std,
+        "block_rankic_se": block_se,
+        "positive_block_ratio": float((blocks > 0).mean()) if not blocks.empty else 0.0,
+        "robust_rankic": robust_score,
+    }
 
 
 def regression_summary(frame: pd.DataFrame, pred_col: str, y_col: str) -> dict[str, float]:
@@ -129,10 +200,24 @@ def score_predictions(predictions: pd.DataFrame, cfg: Mapping[str, Any]) -> tupl
         ic_std = float(ic.std(ddof=1)) if len(ic) > 1 else 0.0
         spread_mean = float(spread.mean()) if not spread.empty else np.nan
         positive_ratio = float((rankic > 0).mean()) if not rankic.empty else 0.0
-        turnover = turnover_proxy(group, pred_col, top_q, min_assets)
+        metric_policy = str(
+            optional_value(
+                cfg,
+                ["evaluation", "metric_policy"],
+                "legacy_pooled",
+            )
+        ).lower()
+        turnover = turnover_proxy(
+            group,
+            pred_col,
+            top_q,
+            min_assets,
+            reset_at_window=metric_policy != "legacy_pooled",
+        )
         instability = float(rankic.std(ddof=1)) if len(rankic) > 1 else 0.0
         complexity_penalty = window_level_mean(group, "complexity_penalty")
         overfit_penalty = window_level_mean(group, "overfit_penalty")
+        robust_rankic, robust_metrics = _robust_rankic_score(group, rankic, cfg)
         rankic_ir = safe_ratio(mean_rankic, rankic_std)
         rankic_ir_score = float(np.clip(finite_or_zero(rankic_ir), -5.0, 5.0))
         spread_score = float(np.clip(0.0 if np.isnan(spread_mean) else spread_mean, -0.05, 0.05))
@@ -161,6 +246,7 @@ def score_predictions(predictions: pd.DataFrame, cfg: Mapping[str, Any]) -> tupl
             "rankic_ir": finite_or_zero(rankic_ir),
             "top_bottom_spread": finite_or_zero(spread_mean),
             "positive_window_ratio": finite_or_zero(positive_ratio),
+            "robust_rankic": robust_rankic,
         }
         objective_score = objective_values[objective]
         rows.append(
@@ -188,6 +274,7 @@ def score_predictions(predictions: pd.DataFrame, cfg: Mapping[str, Any]) -> tupl
                 "objective": objective,
                 "objective_score": float(objective_score),
                 "num_prediction_rows": int(len(group)),
+                **robust_metrics,
             }
         )
     scores = pd.DataFrame(rows).sort_values("objective_score", ascending=False).reset_index(drop=True)

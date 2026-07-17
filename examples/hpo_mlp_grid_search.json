@@ -1,6 +1,7 @@
 {
   "output_root": "../outputs/mlp_grid_search",
   "config": {
+    "compatibility": {"profile": "legacy_v1"},
     "input": {
       "feature_path": "toy_factors.csv",
       "label_path": "toy_labels.csv"
@@ -13,6 +14,7 @@
       "label_col": "y",
       "ticker_dtype": "preserve",
       "all_null_feature_policy": "allow",
+      "strict_point_in_time": false,
       "compute_hash": false
     },
     "validation": {

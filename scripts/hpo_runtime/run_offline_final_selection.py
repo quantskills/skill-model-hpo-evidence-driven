@@ -2,8 +2,8 @@
 
 This script reuses an existing search run's validation trials and config, runs
 local neighborhood checks around top candidates, requests a Codex-external
-selection when configured, and evaluates the selected parameters on the same
-holdout split. It does not rerun the original search rounds.
+selection when configured, and writes frozen selected parameters without
+accessing holdout labels. It does not rerun the original search rounds.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from config_utils import json_default, load_config, write_json, write_resolved_config
-from data_adapter import build_holdout_test_window, build_panel, build_windows
+from data_adapter import build_panel, build_windows
 from decision_provider import ExternalDecisionRequired, request_final_selection_with_provider, resolve_decision_provider_config
 from final_selector import (
     build_final_selection_evidence,
@@ -28,8 +28,14 @@ from final_selector import (
     select_center_candidates,
     validate_final_selection,
 )
-from holdout_evaluator import evaluate_holdout
-from search_runner import _leaderboard_from_history, _mapping, _run_one_trial, _resolve_core_config
+from plugin_loader import configure_extensions
+from search_runner import (
+    _leaderboard_from_history,
+    _mapping,
+    _resolve_core_config,
+    _run_one_trial,
+    _run_seed_confirmation,
+)
 from search_space import resolve_model_type, resolve_search_space
 
 
@@ -102,33 +108,18 @@ def _source_metadata(source_run_dir: Path) -> dict[str, Any]:
     for name, key in [
         ("run_summary.json", "source_run_summary"),
         ("best_params.json", "source_best_params"),
-        ("final_holdout_metrics.json", "source_holdout_metrics"),
     ]:
         path = source_run_dir / name
         if path.exists():
             out[key] = _read_json(path)
     best = out.get("source_best_params") if isinstance(out.get("source_best_params"), dict) else {}
-    holdout = out.get("source_holdout_metrics") if isinstance(out.get("source_holdout_metrics"), dict) else {}
     out.update(
         {
             "source_best_trial_id": best.get("trial_id"),
             "source_best_score": best.get("score"),
-            "source_holdout_rankic_ir": holdout.get("rankic_ir"),
-            "source_holdout_mean_rankic": holdout.get("mean_rankic"),
-            "source_holdout_positive_window_ratio": holdout.get("positive_window_ratio"),
-            "source_holdout_top_bottom_spread": holdout.get("top_bottom_spread"),
         }
     )
     return out
-
-
-def _metric_delta(new_value: Any, old_value: Any) -> float | None:
-    try:
-        if new_value is None or old_value is None:
-            return None
-        return float(new_value) - float(old_value)
-    except (TypeError, ValueError):
-        return None
 
 
 def run_offline_final_selection(
@@ -149,6 +140,7 @@ def run_offline_final_selection(
 
     raw_cfg = load_config(config_path)
     cfg = _resolve_core_config(raw_cfg)
+    configure_extensions(cfg)
     model_type = resolve_model_type(cfg)
     seed = int(cfg.get("task", {}).get("seed", 42))
     search_cfg = _mapping(cfg.get("search"))
@@ -188,7 +180,6 @@ def run_offline_final_selection(
 
     panel_data = build_panel(cfg)
     windows = build_windows(panel_data.panel, cfg)
-    holdout_window = build_holdout_test_window(panel_data.panel, cfg)
     space = _final_space(source_run_dir, cfg, model_type)
 
     center_candidates = select_center_candidates(trial_history, top_k=int(selector_cfg["top_k"]))
@@ -319,14 +310,31 @@ def run_offline_final_selection(
     candidate_by_id = {str(row.get("trial_id")): row for row in center_candidates}
     selected_trial_id = str(final_selection.get("validated_selection", {}).get("selected_trial_id") or score_best_trial["trial_id"])
     selected_trial = dict(candidate_by_id.get(selected_trial_id, score_best_trial))
+    selected_trial, confirmation_summary = _run_seed_confirmation(
+        trial_history=trial_history,
+        initially_selected=selected_trial,
+        model_type=model_type,
+        panel_data=panel_data,
+        windows=windows,
+        cfg=cfg,
+        normalize_method=normalize_method,
+        run_dir=output_dir,
+    )
     best_params = {
         "model_type": model_type,
-        "selected_by": final_selection.get("validated_selection", {}).get("selected_by", "score_best"),
+        "selected_by": (
+            "multi_seed_confirmation"
+            if confirmation_summary.get("enabled")
+            else final_selection.get("validated_selection", {}).get("selected_by", "score_best")
+        ),
         "trial_id": selected_trial["trial_id"],
         "score_best_trial_id": score_best_trial["trial_id"],
         "score_best_score": score_best_trial["score"],
         "objective": selected_trial.get("objective"),
         "score": selected_trial["score"],
+        "search_score": selected_trial.get("search_score", selected_trial["score"]),
+        "confirmation_score": selected_trial.get("confirmation_score"),
+        "confirmation": confirmation_summary,
         "loss": selected_trial.get("loss"),
         "valid_rmse": selected_trial.get("valid_rmse"),
         "valid_mae": selected_trial.get("valid_mae"),
@@ -337,29 +345,12 @@ def run_offline_final_selection(
     }
     write_json(best_params, output_dir / "best_params.json")
 
-    holdout_summary = None
-    if holdout_window is not None:
-        holdout_summary, holdout_predictions, holdout_window_metrics = evaluate_holdout(
-            panel_data=panel_data,
-            holdout_window=holdout_window,
-            model_type=model_type,
-            params=selected_trial["params"],
-            cfg=cfg,
-            seed=seed + 9_999_991,
-            normalize_method=str(normalize_method) if normalize_method else None,
-        )
-        write_json(holdout_summary, output_dir / "final_holdout_metrics.json")
-        if args.save_predictions:
-            holdout_predictions.to_csv(output_dir / "final_holdout_predictions.csv", index=False)
-        holdout_window_metrics.to_csv(output_dir / "final_holdout_window_metrics.csv", index=False)
-
-    old_holdout = source_meta.get("source_holdout_metrics") if isinstance(source_meta.get("source_holdout_metrics"), dict) else {}
     offline_summary = {
         "run_id": output_dir.name,
         "source_run_dir": str(source_run_dir),
         "output_dir": str(output_dir),
         "model_type": model_type,
-        "status": "evaluated",
+        "status": "selected_not_tested",
         "num_source_trials": len(trial_history),
         "num_center_candidates": len(center_candidates),
         "num_final_neighbor_trials": len(final_neighbor_rows),
@@ -372,25 +363,9 @@ def run_offline_final_selection(
         "final_selection_accepted": bool(final_selection.get("accepted")),
         "final_selection_source": final_selection.get("source"),
         "final_selection_errors": final_selection.get("validation_errors", []),
-        "source_holdout_rankic_ir": old_holdout.get("rankic_ir"),
-        "selected_holdout_rankic_ir": (holdout_summary or {}).get("rankic_ir"),
-        "holdout_rankic_ir_delta": _metric_delta((holdout_summary or {}).get("rankic_ir"), old_holdout.get("rankic_ir")),
-        "source_holdout_mean_rankic": old_holdout.get("mean_rankic"),
-        "selected_holdout_mean_rankic": (holdout_summary or {}).get("mean_rankic"),
-        "holdout_mean_rankic_delta": _metric_delta((holdout_summary or {}).get("mean_rankic"), old_holdout.get("mean_rankic")),
-        "source_holdout_positive_window_ratio": old_holdout.get("positive_window_ratio"),
-        "selected_holdout_positive_window_ratio": (holdout_summary or {}).get("positive_window_ratio"),
-        "holdout_positive_window_ratio_delta": _metric_delta(
-            (holdout_summary or {}).get("positive_window_ratio"), old_holdout.get("positive_window_ratio")
-        ),
-        "source_holdout_top_bottom_spread": old_holdout.get("top_bottom_spread"),
-        "selected_holdout_top_bottom_spread": (holdout_summary or {}).get("top_bottom_spread"),
-        "holdout_top_bottom_spread_delta": _metric_delta(
-            (holdout_summary or {}).get("top_bottom_spread"), old_holdout.get("top_bottom_spread")
-        ),
+        "holdout_status": "sealed_not_loaded",
         "decision_provider_type": decision_provider_config.get("type"),
         "decision_provider": dict(decision_provider_config),
-        "save_predictions": bool(args.save_predictions),
     }
     write_json(offline_summary, output_dir / "offline_summary.json")
     return offline_summary
@@ -412,7 +387,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-score-drop", type=float, default=None, help="Maximum validation score drop allowed for LLM-selected candidate")
     parser.add_argument("--max-all-trials-in-prompt", type=int, default=None, help="Maximum historical successful trials included in LLM evidence")
     parser.add_argument("--seed-offset", type=int, default=8_888_881, help="RNG offset for neighborhood generation")
-    parser.add_argument("--save-predictions", action="store_true", help="Save final_holdout_predictions.csv; can be large")
     return parser
 
 
@@ -439,13 +413,10 @@ def main(argv: list[str] | None = None) -> int:
         "score_best_trial_id",
         "score_drop_from_best",
         "final_selection_accepted",
-        "selected_holdout_rankic_ir",
-        "source_holdout_rankic_ir",
-        "holdout_rankic_ir_delta",
     ]:
         if key in summary:
             print(f"{key}: {summary[key]}")
-    return 0 if summary.get("status") == "evaluated" else 1
+    return 0 if summary.get("status") == "selected_not_tested" else 1
 
 
 if __name__ == "__main__":
