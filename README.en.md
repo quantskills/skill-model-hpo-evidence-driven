@@ -4,6 +4,10 @@
 
 > Hyperparameter optimization skill for quant factor models. It supports evidence-driven LLM decision search-space adaptation and deterministic grid search for built-in LGBM/MLP and explicitly registered local model extensions.
 
+This repository is maintained as a QUANTSKILLS community contribution. It is not an official, certified, endorsed, or production-validated QUANTSKILLS project.
+
+Maintainer: QUANTSKILLS community contributors.
+
 ## What It Does
 
 This repository packages a model hyperparameter optimization workflow as a reusable agent skill. It does not compute alpha factors and does not run a production portfolio backtest. It assumes local factor and label files are already prepared.
@@ -63,3 +67,7 @@ See `references/input_schema.md`, `references/codex_external_workflow.md`, and `
 ## Boundary
 
 This is a research tool for model hyperparameter search. It does not provide investment advice and does not guarantee trading performance.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).

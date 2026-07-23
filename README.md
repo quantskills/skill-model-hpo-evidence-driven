@@ -10,6 +10,8 @@
 
 本项目作为 QUANTSKILLS 社区贡献提交，不代表官方认证、投资建议或生产交易验证。
 
+维护者：QUANTSKILLS 社区贡献者。
+
 不是因子库，也不是回测引擎，而是一个**面向量化多因子模型的 HPO Skill**：把“寻找一组可复现实验参数”拆成数据读取、训练验证、trial evidence 记录、搜索空间决策、最终参数输出等标准步骤。
 
 `role: skill` `platform: codex` `category: tooling` `status: active` `validation: runnable` `output: best-hyperparameters` `paradigm: evidence-driven hpo / grid search`

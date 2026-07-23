@@ -1,25 +1,23 @@
 ---
 name: model-hpo-evidence-driven
 description: "Run evidence-driven or deterministic grid hyperparameter search for quantitative multi-factor models. Use when an agent needs legacy-compatible RankIC-IR LGBM/MLP results, or explicitly opts into robust block RankIC, common-seed confirmation, strict point-in-time checks, and sealed holdout evaluation."
-metadata:
-  short-description: Evidence-driven or grid model hyperparameter search
-  quantSkills:
-    organization: https://github.com/quantskills
-    repository: quantskills/skill-model-hpo-evidence-driven
-    repository_url: https://github.com/quantskills/skill-model-hpo-evidence-driven
-    project_type: skill
-    collection: model-hpo
-    license: GPL-3.0-only
-    category: tooling
-    tags: [model-hpo, hyperparameter-search, evidence-driven, grid-search]
-    platforms: [codex]
-    language: zh-en
-    status: active
-    validation_level: runnable
-    maintainer_type: community
-    requires: []
-    summary_zh: 使用 trial evidence 驱动的 LLM 搜索空间调整或确定性 grid 搜索优化 LGBM/MLP 多因子模型超参数。
-    summary_en: Optimize LGBM/MLP quant factor model hyperparameters with trial-evidence-driven LLM search-space adaptation or deterministic grid search.
+quantSkills:
+  organization: https://github.com/quantskills
+  repository: quantskills/skill-model-hpo-evidence-driven
+  repository_url: https://github.com/quantskills/skill-model-hpo-evidence-driven
+  project_type: skill
+  collection: model-hpo
+  license: GPL-3.0-only
+  category: tooling
+  tags: [model-hpo, hyperparameter-search, evidence-driven, grid-search]
+  platforms: [codex]
+  language: zh-en
+  status: active
+  validation_level: runnable
+  maintainer_type: community
+  requires: []
+  summary_zh: 使用 trial evidence 驱动的 LLM 搜索空间调整或确定性 grid 搜索优化 LGBM/MLP 多因子模型超参数。
+  summary_en: Optimize LGBM/MLP quant factor model hyperparameters with trial-evidence-driven LLM search-space adaptation or deterministic grid search.
 ---
 
 ```json qsh-form

@@ -1,5 +1,4 @@
-name: model-hpo-evidence-driven
-entrypoint: SKILL.md
-display_name: Model HPO Evidence Driven
-short_description: Reproduce legacy RankIC-IR HPO or opt into robust sealed-holdout validation.
-default_prompt: Run the default legacy_v1 LGBM smoke search, verify its historical score and automatic holdout artifacts, and report the compatibility profile used.
+interface:
+  display_name: "Model HPO Evidence Driven"
+  short_description: "Evidence-driven and grid HPO for quant models"
+  default_prompt: "Use $model-hpo-evidence-driven to run a reproducible LGBM or MLP hyperparameter search and report the selected compatibility profile, trial evidence, and best parameters."
